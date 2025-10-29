@@ -313,7 +313,7 @@ def handle_odoo_order():
 
     Expected payload structure:
     {
-        "sale_order_id": 48
+        "id": 48
     }
 
     This will:
@@ -328,7 +328,7 @@ def handle_odoo_order():
         if not data or 'sale_order_id' not in data:
             return jsonify({'error': 'Missing sale_order_id in request'}), 400
 
-        sale_order_id = data['sale_order_id']
+        sale_order_id = data['id']
 
         # Get Odoo connection using existing helper functions
         uid = get_uid()
