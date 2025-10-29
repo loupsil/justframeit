@@ -402,6 +402,51 @@ def handle_odoo_order():
             width, height, price, components
         )
 
+        # Compute BOM cost for the newly created product
+        try:
+            # Get the product template ID from the created product
+            product_data = models.execute_kw(
+                ODOO_DB, uid, ODOO_API_KEY,
+                'product.product', 'read', [product_id], {'fields': ['product_tmpl_id']}
+            )
+            product_tmpl_id = product_data[0]['product_tmpl_id'][0]
+
+            # Get initial cost before computing BOM
+            initial_cost = models.execute_kw(
+                ODOO_DB, uid, ODOO_API_KEY,
+                'product.template', 'read',
+                [[product_tmpl_id]],
+                {'fields': ['standard_price']}
+            )[0]['standard_price']
+
+            print(f"Initial cost: {initial_cost}")
+
+            # Compute BOM cost - ignore return value from button_bom_cost
+            models.execute_kw(
+                ODOO_DB, uid, ODOO_API_KEY,
+                'product.template', 'button_bom_cost',
+                [[product_tmpl_id]]
+            )
+
+            # Get new cost after computation
+            new_cost = models.execute_kw(
+                ODOO_DB, uid, ODOO_API_KEY,
+                'product.template', 'read',
+                [[product_tmpl_id]],
+                {'fields': ['standard_price']}
+            )[0]['standard_price']
+
+            print(f"New cost after BOM computation: {new_cost}")
+
+            if new_cost != initial_cost:
+                print("✅ Cost change detected - BOM computation successful")
+            else:
+                print("⚠️ Warning: No cost change detected after BOM computation")
+
+        except Exception as e:
+            print(f"⚠️ Warning: Failed to compute BOM cost: {str(e)}")
+            # Continue with order processing even if BOM cost computation fails
+
         # Update existing sale order with new product
         models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
             'sale.order', 'write',
