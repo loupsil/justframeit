@@ -1,0 +1,6 @@
+.env
+.ipynb
+.docx
+.venv
+*.pyc
+__pycache__/
