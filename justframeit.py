@@ -325,7 +325,7 @@ def handle_odoo_order():
     try:
         # Get payload from request
         data = request.get_json()
-        if not data or 'sale_order_id' not in data:
+        if not data or 'id' not in data:
             return jsonify({'error': 'Missing sale_order_id in request'}), 400
 
         sale_order_id = data['id']
