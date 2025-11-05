@@ -59,6 +59,63 @@ def get_uid():
         logger.error(f"Failed to authenticate with Odoo: {str(e)}")
         raise
 
+def get_or_create_customer(models, uid, customer_data):
+    """
+    Get existing customer by email or create new one if not found.
+
+    Args:
+        models: Odoo models proxy
+        uid: User ID
+        customer_data: Dictionary containing customer information
+
+    Returns:
+        int: Partner ID of the customer
+    """
+    print(f"Searching for customer with email: {customer_data['email']}")
+
+    # Search for existing customer by email
+    partner_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+        'res.partner', 'search',
+        [[['email', '=', customer_data['email']]]])
+
+    if partner_ids:
+        # Customer exists, return existing ID
+        partner_id = partner_ids[0]
+        print(f"Found existing customer '{customer_data['name']}' with email {customer_data['email']} (ID: {partner_id})")
+        logger.info(f"Found existing customer with email {customer_data['email']}: ID {partner_id}")
+        return partner_id
+
+    # Customer doesn't exist, create new one
+    partner_vals = {
+        'name': customer_data['name'],
+        'email': customer_data['email'],
+        'customer_rank': 1,  # Mark as customer
+    }
+
+    # Add optional fields if provided
+    if customer_data.get('phone'):
+        partner_vals['phone'] = customer_data['phone']
+    if customer_data.get('street'):
+        partner_vals['street'] = customer_data['street']
+    if customer_data.get('city'):
+        partner_vals['city'] = customer_data['city']
+    if customer_data.get('zip'):
+        partner_vals['zip'] = customer_data['zip']
+    if customer_data.get('country'):
+        # Search for country by name
+        country_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+            'res.country', 'search',
+            [[['name', 'ilike', customer_data['country']]]])
+        if country_ids:
+            partner_vals['country_id'] = country_ids[0]
+
+    partner_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+        'res.partner', 'create', [partner_vals])
+
+    print(f"🆕 Created new customer '{customer_data['name']}' with email {customer_data['email']} (ID: {partner_id})")
+    logger.info(f"Created new customer {customer_data['name']} with email {customer_data['email']}: ID {partner_id}")
+    return partner_id
+
 def create_product_and_bom(models, uid, product_name, product_reference, width, height, price, components):
     """
     Shared function to create product and BOM with components and operations.
@@ -218,6 +275,15 @@ def handle_web_order():
 
     Expected payload structure:
     {
+        "customer": {
+            "name": "John Doe",
+            "email": "john.doe@example.com",
+            "phone": "+1234567890",
+            "street": "123 Main St",
+            "city": "New York",
+            "zip": "10001",
+            "country": "United States"
+        },
         "product": {
             "width": 400,
             "height": 400,
@@ -244,8 +310,8 @@ def handle_web_order():
     try:
         # Get payload from request
         data = request.get_json()
-        if not data or 'product' not in data:
-            return jsonify({'error': 'Missing product data in request'}), 400
+        if not data or 'product' not in data or 'customer' not in data:
+            return jsonify({'error': 'Missing product or customer data in request'}), 400
 
         payload = data
 
@@ -268,6 +334,9 @@ def handle_web_order():
         uid = get_uid()
         models = get_odoo_models()
 
+        # Get or create customer
+        partner_id = get_or_create_customer(models, uid, payload['customer'])
+
         # Use shared function to create product and BOM
         product_id, bom_id = create_product_and_bom(
             models, uid,
@@ -278,7 +347,7 @@ def handle_web_order():
 
         # Create sale order
         order_vals = {
-            'partner_id': 1,  # Default customer ID, adjust as needed
+            'partner_id': partner_id,
             'order_line': [(0, 0, {
                 'product_id': product_id,
                 'product_uom_qty': 1,
@@ -289,6 +358,7 @@ def handle_web_order():
         order_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
             'sale.order', 'create', [order_vals])
 
+        print(f"Created/Found customer ID: {partner_id}")
         print(f"Created product ID: {product_id}")
         print(f"Created BOM ID: {bom_id}")
         print(f"Created sale order ID: {order_id}")
@@ -296,6 +366,7 @@ def handle_web_order():
 
         return jsonify({
             'message': 'Sale order from web simulation finished',
+            'partner_id': partner_id,
             'product_id': product_id,
             'bom_id': bom_id,
             'order_id': order_id,
@@ -488,3 +559,7 @@ def handle_odoo_order():
     except Exception as e:
         logger.error(f"Error handling Odoo order: {str(e)}")
         return jsonify({'error': str(e), 'status': 'error'}), 500
+    
+    
+    
+    
