@@ -230,30 +230,23 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
             service_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
                 'x_services', 'read',
                 [service_id],
-                {'fields': ['x_name', 'x_soort', 'x_studio_associated_work_center']})
+                {'fields': ['x_name', 'x_studio_associated_work_center']})
 
-            logger.debug(f"Service info: {service_info[0]['x_name']} ({service_info[0]['x_soort']})")
+            logger.debug(f"Service info: {service_info[0]['x_name']}")
 
             # Get duration rules directly from component
             logger.debug("Reading duration rules")
             duration_rules = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
                 'x_services_duration_rules', 'read',
                 [component_info[0]['x_studio_associated_service_duration_rule']],
-                {'fields': ['x_omtrek', 'x_oppervlakte', 'x_duurtijd_totaal']})
+                {'fields': ['x_studio_quantity', 'x_duurtijd_totaal']})
 
-            # Find appropriate duration based on x_soort
-            if service_info[0]['x_soort'] == 'Oppervlakte':
-                relevant_value = surface_m2  # Use m² value
-                rules_sorted = sorted(duration_rules, key=lambda x: x['x_oppervlakte'])
-                matching_rule = next((rule for rule in rules_sorted if rule['x_oppervlakte'] >= relevant_value), rules_sorted[-1])
-                duration_seconds = matching_rule['x_duurtijd_totaal']
-                logger.debug(f"Duration calculation: Surface-based ({relevant_value} m²) → {duration_seconds} seconds")
-            else:  # 'Omtrek'
-                relevant_value = circumference_m  # Use m value
-                rules_sorted = sorted(duration_rules, key=lambda x: x['x_omtrek'])
-                matching_rule = next((rule for rule in rules_sorted if rule['x_omtrek'] >= relevant_value), rules_sorted[-1])
-                duration_seconds = matching_rule['x_duurtijd_totaal']
-                logger.debug(f"Duration calculation: Circumference-based ({relevant_value} m) → {duration_seconds} seconds")
+            # Find appropriate duration based on x_studio_quantity
+            relevant_value = quantity  # Use the calculated quantity (surface, circumference, or default)
+            rules_sorted = sorted(duration_rules, key=lambda x: x['x_studio_quantity'])
+            matching_rule = next((rule for rule in rules_sorted if rule['x_studio_quantity'] >= relevant_value), rules_sorted[-1])
+            duration_seconds = matching_rule['x_duurtijd_totaal']
+            logger.debug(f"Duration calculation: Quantity-based ({relevant_value}) → {duration_seconds} seconds")
 
             # Convert duration from seconds to minutes and calculate MM:SS format
             duration_minutes = duration_seconds / 60
