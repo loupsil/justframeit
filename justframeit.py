@@ -357,12 +357,16 @@ def interpret_craft_payload(craft_payload):
 
         logger.debug(f"Configuration keys: {list(configuration.keys()) if configuration else 'None'}")
 
-        # Extract dimensions
-        width = configuration.get('width', 0)
-        height = configuration.get('height', 0)
+        # Extract dimensions (convert from cm to mm)
+        width_cm = configuration.get('width', 0)
+        height_cm = configuration.get('height', 0)
         price = line_item.get('total', 0)
 
-        logger.info(f"Dimensions: {width}mm x {height}mm, Price: €{price}")
+        # Convert cm to mm
+        width = width_cm * 10
+        height = height_cm * 10
+
+        logger.info(f"Dimensions: {width}mm x {height}mm (converted from {width_cm}cm x {height_cm}cm), Price: €{price}")
 
         # Extract components from SKUs
         logger.info("Extracting components from SKUs")
