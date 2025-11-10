@@ -1,6 +1,9 @@
 from flask import Blueprint, jsonify, request
 import xmlrpc.client
 import os
+import json
+import base64
+from io import StringIO
 from dotenv import load_dotenv
 import logging
 from datetime import datetime
@@ -59,6 +62,98 @@ def get_uid():
         logger.error(f"Failed to authenticate with Odoo: {str(e)}")
         raise
 
+def log_route_call(models, uid, route_name, payload, server_logs, response_data):
+    """
+    Log route calls to Odoo ir.logging model.
+
+    Args:
+        models: Odoo models proxy (can be None - function will establish connection if needed)
+        uid: User ID (can be None - function will authenticate if needed)
+        route_name: Name of the route being called
+        payload: The request payload (dict)
+        server_logs: Captured server logs (string)
+        response_data: The final response data returned by the route (dict)
+
+    Returns:
+        int: ID of the created log record, or None if logging failed
+    """
+    try:
+        # If models or uid are missing, try to establish connection
+        if not models or not uid:
+            logger.info(f"Attempting to establish Odoo connection for logging: {route_name}")
+            try:
+                uid = get_uid()
+                models = get_odoo_models()
+                logger.info("Successfully established Odoo connection for logging")
+            except Exception as conn_error:
+                logger.warning(f"Cannot log to Odoo - failed to establish connection. Route: {route_name}, Error: {str(conn_error)}")
+                return None
+
+        logger.info(f"Logging route call to Odoo ir.logging model: {route_name}")
+
+        # Format the log entry in a readable way
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # Format payload as readable JSON
+        payload_formatted = json.dumps(payload, indent=2, ensure_ascii=False)
+
+        # Format response data as readable JSON
+        response_formatted = json.dumps(response_data, indent=2, ensure_ascii=False)
+
+        # Determine log level based on response status
+        is_error = response_data.get('status') == 'error'
+        log_level = 'error' if is_error else 'info'
+
+        # Set appropriate name based on operation type and status
+        if route_name == '/handle-web-order':
+            log_name = 'Web Order Processing'
+        elif route_name == '/handle-odoo-order':
+            log_name = 'Odoo Order Processing'
+        else:
+            log_name = 'API Operation'
+
+        # Create the notes content
+        notes_content = f"""🕒 Timestamp: {timestamp}
+📍 Route: {route_name}
+⚠️  Status: {'ERROR' if is_error else 'SUCCESS'}
+
+📋 PAYLOAD:
+{payload_formatted}
+
+📤 RESPONSE:
+{response_formatted}
+
+📝 SERVER LOGS:
+{server_logs}
+
+{'='*80}
+"""
+
+        # Create log record in Odoo ir.logging model
+        log_vals = {
+            'name': log_name,
+            'message': response_formatted,
+            'x_studio_notes': notes_content,
+            'type': 'server',  # Standard type for server logs
+            'level': log_level,  # Error level for failed operations, info for successful
+            'path': f'Route: {route_name}',  # Required path field - set to route name
+            'func': 'log_route_call',  # Function name where logging occurs
+            'line': '0',  # Line number (set to 0 since we don't have actual line number)
+            'dbname': ODOO_DB  # Database name from environment
+        }
+
+        # Try to create the log record in ir.logging model
+        log_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+            'ir.logging', 'create', [log_vals])
+
+        logger.info(f"Successfully created log record with ID: {log_id}")
+        return log_id
+
+    except Exception as e:
+        logger.error(f"Failed to create log record in Odoo: {str(e)}")
+        # Don't raise the exception - logging failure shouldn't break the main flow
+        return None
+
 def get_or_create_customer(models, uid, customer_data):
     """
     Get existing customer by email or create new one if not found.
@@ -69,7 +164,7 @@ def get_or_create_customer(models, uid, customer_data):
         customer_data: Dictionary containing customer information
 
     Returns:
-        int: Partner ID of the customer
+        tuple: (partner_id, customer_action) where customer_action is 'found' or 'created'
     """
     logger.info(f"Searching for customer with email: {customer_data['email']}")
 
@@ -82,7 +177,7 @@ def get_or_create_customer(models, uid, customer_data):
         # Customer exists, return existing ID
         partner_id = partner_ids[0]
         logger.info(f"Found existing customer '{customer_data['name']}' with email {customer_data['email']} (ID: {partner_id})")
-        return partner_id
+        return partner_id, 'found'
 
     # Customer doesn't exist, create new one
     logger.info(f"Creating new customer: {customer_data['name']}")
@@ -119,7 +214,7 @@ def get_or_create_customer(models, uid, customer_data):
         'res.partner', 'create', [partner_vals])
 
     logger.info(f"Created new customer '{customer_data['name']}' with email {customer_data['email']} (ID: {partner_id})")
-    return partner_id
+    return partner_id, 'created'
 
 def create_product_and_bom(models, uid, product_name, product_reference, width, height, price, components):
     """
@@ -136,7 +231,7 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
         components: List of component dictionaries with 'name' and 'reference' keys
 
     Returns:
-        tuple: (product_id, bom_id)
+        tuple: (product_id, bom_id, bom_components_count, bom_operations_count)
     """
     logger.info("Starting product and BOM creation process")
     logger.info(f"Product: {product_name} (ref: {product_reference})")
@@ -293,7 +388,7 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
     logger.info(f"BOM created with ID: {bom_id}")
     logger.info("Product and BOM creation completed successfully")
 
-    return product_id, bom_id
+    return product_id, bom_id, len(bom_components), len(bom_operations)
 
 def interpret_craft_payload(craft_payload):
     """
@@ -491,6 +586,13 @@ def handle_web_order():
     Note: 'name' and 'reference' fields are optional and will be auto-generated with timestamps if not provided.
     """
     try:
+        # Set up log capture
+        log_capture_string = StringIO()
+        log_handler = logging.StreamHandler(log_capture_string)
+        log_handler.setLevel(logging.DEBUG)
+        log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        logger.addHandler(log_handler)
+
         logger.info("Starting web order processing")
 
         # Get payload from request
@@ -552,11 +654,11 @@ def handle_web_order():
 
         # Get or create customer
         logger.info("Processing customer information")
-        partner_id = get_or_create_customer(models, uid, payload['customer'])
+        partner_id, customer_action = get_or_create_customer(models, uid, payload['customer'])
 
         # Use shared function to create product and BOM
         logger.info("Creating product and BOM")
-        product_id, bom_id = create_product_and_bom(
+        product_id, bom_id, bom_components_count, bom_operations_count = create_product_and_bom(
             models, uid,
             product_name, product_reference,
             payload['product']['width'], payload['product']['height'],
@@ -581,7 +683,142 @@ def handle_web_order():
         logger.info("Web order processing completed successfully")
         logger.info(f"Results - Customer ID: {partner_id}, Product ID: {product_id}, BOM ID: {bom_id}, Order ID: {order_id}")
 
-        return jsonify({
+        # Save original payload as attachment
+        attachment_ids = []
+        try:
+            payload_json = json.dumps(data, indent=2, ensure_ascii=False)
+            attachment_name = f"order_payload_{timestamp}.json"
+
+            attachment_vals = {
+                'name': attachment_name,
+                'type': 'binary',
+                'datas': base64.b64encode(payload_json.encode('utf-8')).decode('ascii'),  # Base64 encode the UTF-8 bytes
+                'res_model': 'sale.order',
+                'res_id': order_id,
+                'mimetype': 'application/json'
+            }
+
+            attachment_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                'ir.attachment', 'create', [attachment_vals])
+
+            attachment_ids = [attachment_id]
+            logger.info(f"Successfully created payload attachment: {attachment_name} (ID: {attachment_id})")
+        except Exception as e:
+            logger.error(f"Failed to create payload attachment: {str(e)}")
+
+        # Save processing logs as text attachment
+        try:
+            # Get the captured logs and remove the handler
+            log_contents = log_capture_string.getvalue()
+            logger.removeHandler(log_handler)
+            log_capture_string.close()
+
+            log_attachment_name = f"order_processing_logs_{timestamp}.txt"
+
+            log_attachment_vals = {
+                'name': log_attachment_name,
+                'type': 'binary',
+                'datas': base64.b64encode(log_contents.encode('utf-8')).decode('ascii'),  # Base64 encode the UTF-8 bytes
+                'res_model': 'sale.order',
+                'res_id': order_id,
+                'mimetype': 'text/plain'
+            }
+
+            log_attachment_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                'ir.attachment', 'create', [log_attachment_vals])
+
+            attachment_ids.append(log_attachment_id)
+            logger.info(f"Successfully created log attachment: {log_attachment_name} (ID: {log_attachment_id})")
+        except Exception as e:
+            logger.error(f"Failed to create log attachment: {str(e)}")
+            # Clean up the handler even if attachment creation fails
+            try:
+                logger.removeHandler(log_handler)
+                log_capture_string.close()
+            except:
+                pass
+
+        # Create comprehensive HTML chatter message with all logs and final return
+        component_list_items = []
+        for i, component in enumerate(payload['product']['components'], 1):
+            component_list_items.append(f"<li>Component {i}: {component['name']} (ref: {component['reference']})</li>")
+
+        chatter_message = f"""<p><strong>🎯 {payload_type} Order Processing Completed Successfully</strong></p>
+
+<p><em>📎 Attachments: order_payload_{timestamp}.json, order_processing_logs_{timestamp}.txt</em></p>
+
+<p><strong>📋 Order Summary:</strong></p>
+<ul>
+<li>Customer ID: {partner_id}</li>
+<li>Product ID: {product_id}</li>
+<li>BOM ID: {bom_id}</li>
+<li>Order ID: {order_id}</li>
+<li>Payload Type: {payload_type}</li>
+<li>Status: success</li>
+</ul>
+
+<p><strong>📝 Processing Details:</strong></p>
+
+<p><strong>Payload Processing:</strong></p>
+<ul>
+<li>Detected {payload_type} payload format</li>
+<li>Payload processed successfully</li>
+</ul>
+
+<p><strong>Customer Processing:</strong></p>
+<ul>
+<li>Searched for customer with email: {payload['customer']['email']}</li>
+<li>{customer_action.title()} customer: {payload['customer']['name']} ({payload['customer']['email']})</li>
+</ul>
+
+<p><strong>Product Creation:</strong></p>
+<ul>
+<li>Product: {product_name} (ref: {product_reference})</li>
+<li>Dimensions: {payload['product']['width']}mm x {payload['product']['height']}mm</li>
+<li>Price: €{payload['product']['price']}</li>
+<li>Components: {len(payload['product']['components'])} items</li>
+</ul>
+
+<p><strong>BOM Creation:</strong></p>
+<ul>
+<li>Surface: {payload['product']['width'] * payload['product']['height']} mm² ({(payload['product']['width'] * payload['product']['height'])/1000000:.4f} m²)</li>
+<li>Circumference: {2 * (payload['product']['width'] + payload['product']['height'])} mm ({2 * (payload['product']['width'] + payload['product']['height'])/1000:.2f} m)</li>
+<li>BOM components: {bom_components_count} items</li>
+<li>BOM operations: {bom_operations_count} items</li>
+</ul>
+
+<p><strong>Components Processed:</strong></p>
+<ul>{''.join(component_list_items)}</ul>
+
+<p><strong>Final Return Data:</strong></p>
+<ul>
+<li>message: '{payload_type} order processing finished'</li>
+<li>partner_id: {partner_id}</li>
+<li>product_id: {product_id}</li>
+<li>bom_id: {bom_id}</li>
+<li>order_id: {order_id}</li>
+<li>payload_type: {payload_type}</li>
+<li>status: 'success'</li>
+</ul>"""
+
+        # Post the comprehensive message to the sale order's chatter
+        try:
+            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                'sale.order', 'message_post',
+                [order_id],
+                {
+                    'body': chatter_message,
+                    'body_is_html': True,                # keep HTML rendering
+                    'message_type': 'comment',
+                    'subtype_xmlid': 'mail.mt_note',     # 🔑 internal note
+                    'attachment_ids': attachment_ids,
+                })
+            logger.info(f"Successfully posted comprehensive processing logs to sale order {order_id} chatter")
+        except Exception as e:
+            logger.error(f"Failed to post message to sale order chatter: {str(e)}")
+
+        # Prepare response data
+        response_data = {
             'message': f'{payload_type} order processing finished',
             'partner_id': partner_id,
             'product_id': product_id,
@@ -589,11 +826,35 @@ def handle_web_order():
             'order_id': order_id,
             'payload_type': payload_type,
             'status': 'success'
-        })
+        }
+
+        # Log the route call to Odoo logging model
+        log_route_call(models, uid, '/handle-web-order', data, log_contents, response_data)
+
+        return jsonify(response_data)
 
     except Exception as e:
+        # Clean up log handler and get logs if available
+        log_contents = ""
+        try:
+            if 'log_handler' in locals() and 'log_capture_string' in locals():
+                log_contents = log_capture_string.getvalue()
+                logger.removeHandler(log_handler)
+                log_capture_string.close()
+        except:
+            pass
+
         logger.error(f"Error handling web order: {str(e)}")
-        return jsonify({'error': str(e), 'status': 'error'}), 500
+
+        # Prepare error response data
+        error_response = {'error': str(e), 'status': 'error'}
+
+        # Log the error to Odoo logging model
+        # Use original data if available, otherwise use empty dict
+        request_data = data if 'data' in locals() else {}
+        log_route_call(None, None, '/handle-web-order', request_data, log_contents, error_response)
+
+        return jsonify(error_response), 500
 
 @justframeit_bp.route('/handle-odoo-order', methods=['POST'])
 def handle_odoo_order():
@@ -612,6 +873,13 @@ def handle_odoo_order():
     4. Update the existing sale order with the new product
     """
     try:
+        # Set up log capture
+        log_capture_string = StringIO()
+        log_handler = logging.StreamHandler(log_capture_string)
+        log_handler.setLevel(logging.DEBUG)
+        log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        logger.addHandler(log_handler)
+
         logger.info("Starting Odoo order processing")
 
         # Get payload from request
@@ -712,7 +980,7 @@ def handle_odoo_order():
 
         # Use shared function to create product and BOM
         logger.info("Creating new product and BOM")
-        product_id, bom_id = create_product_and_bom(
+        product_id, bom_id, _, _ = create_product_and_bom(
             models, uid,
             product_name, product_reference,
             width, height, price, components
@@ -795,16 +1063,180 @@ def handle_odoo_order():
         logger.info("Odoo order processing completed successfully")
         logger.info(f"Results - Product ID: {product_id}, BOM ID: {bom_id}, Updated Order ID: {sale_order_id}")
 
-        return jsonify({
+        # Generate timestamp for unique naming
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        # Save original payload as attachment
+        attachment_ids = []
+        try:
+            payload_json = json.dumps(data, indent=2, ensure_ascii=False)
+            attachment_name = f"odoo_order_payload_{timestamp}.json"
+
+            attachment_vals = {
+                'name': attachment_name,
+                'type': 'binary',
+                'datas': base64.b64encode(payload_json.encode('utf-8')).decode('ascii'),  # Base64 encode the UTF-8 bytes
+                'res_model': 'sale.order',
+                'res_id': sale_order_id,
+                'mimetype': 'application/json'
+            }
+
+            attachment_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                'ir.attachment', 'create', [attachment_vals])
+
+            attachment_ids = [attachment_id]
+            logger.info(f"Successfully created payload attachment: {attachment_name} (ID: {attachment_id})")
+        except Exception as e:
+            logger.error(f"Failed to create payload attachment: {str(e)}")
+
+        # Save processing logs as text attachment
+        try:
+            # Get the captured logs and remove the handler
+            log_contents = log_capture_string.getvalue()
+            logger.removeHandler(log_handler)
+            log_capture_string.close()
+
+            log_attachment_name = f"odoo_order_processing_logs_{timestamp}.txt"
+
+            log_attachment_vals = {
+                'name': log_attachment_name,
+                'type': 'binary',
+                'datas': base64.b64encode(log_contents.encode('utf-8')).decode('ascii'),  # Base64 encode the UTF-8 bytes
+                'res_model': 'sale.order',
+                'res_id': sale_order_id,
+                'mimetype': 'text/plain'
+            }
+
+            log_attachment_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                'ir.attachment', 'create', [log_attachment_vals])
+
+            attachment_ids.append(log_attachment_id)
+            logger.info(f"Successfully created log attachment: {log_attachment_name} (ID: {log_attachment_id})")
+        except Exception as e:
+            logger.error(f"Failed to create log attachment: {str(e)}")
+            # Clean up the handler even if attachment creation fails
+            try:
+                logger.removeHandler(log_handler)
+                log_capture_string.close()
+            except:
+                pass
+
+        # Create comprehensive HTML chatter message with all logs and final return
+        component_list_items = []
+        for i, component in enumerate(components, 1):
+            component_list_items.append(f"<li>Component {i}: {component['name']} (ref: {component['reference']})</li>")
+
+        chatter_message = f"""<p><strong>🔄 Odoo Order Processing Completed Successfully</strong></p>
+
+<p><em>📎 Attachments: odoo_order_payload_{timestamp}.json, odoo_order_processing_logs_{timestamp}.txt</em></p>
+
+<p><strong>📋 Order Summary:</strong></p>
+<ul>
+<li>Original Order ID: {sale_order_id}</li>
+<li>New Product ID: {product_id}</li>
+<li>New BOM ID: {bom_id}</li>
+<li>Status: success</li>
+</ul>
+
+<p><strong>📝 Processing Details:</strong></p>
+
+<p><strong>Order Analysis:</strong></p>
+<ul>
+<li>Read existing sale order details</li>
+<li>Extracted product specs: {width}mm x {height}mm, €{price}</li>
+<li>Original product: {product_info[0]['name']} ({product_info[0]['default_code']})</li>
+<li>Found BOM ID: {bom_ids[0]}</li>
+</ul>
+
+<p><strong>Component Copying:</strong></p>
+<ul>
+<li>Copied {len(components)} components from existing BOM</li>
+</ul>
+
+<p><strong>Product Creation:</strong></p>
+<ul>
+<li>New product: {product_name} (ref: {product_reference})</li>
+<li>Dimensions: {width}mm x {height}mm</li>
+<li>Price: €{price}</li>
+<li>Surface: {width * height} mm² ({(width * height)/1000000:.4f} m²)</li>
+<li>Circumference: {2 * (width + height)} mm ({2 * (width + height)/1000:.2f} m)</li>
+</ul>
+
+<p><strong>Components Processed:</strong></p>
+<ul>{''.join(component_list_items)}</ul>
+
+<p><strong>BOM Cost Computation:</strong></p>
+<ul>
+<li>Initial cost: €{initial_cost if 'initial_cost' in locals() else 'N/A'}</li>
+<li>Cost after computation: €{new_cost if 'new_cost' in locals() else 'N/A'}</li>
+</ul>
+
+<p><strong>Order Update:</strong></p>
+<ul>
+<li>Updated sale order with new product</li>
+<li>Triggered price update based on pricelist</li>
+</ul>
+
+<p><strong>Final Return Data:</strong></p>
+<ul>
+<li>message: 'Odoo order processing finished'</li>
+<li>product_id: {product_id}</li>
+<li>bom_id: {bom_id}</li>
+<li>updated_order_id: {sale_order_id}</li>
+<li>status: 'success'</li>
+</ul>"""
+
+        # Post the comprehensive message to the sale order's chatter
+        try:
+            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                'sale.order', 'message_post',
+                [sale_order_id],
+                {
+                    'body': chatter_message,
+                    'body_is_html': True,                # keep HTML rendering
+                    'message_type': 'comment',
+                    'subtype_xmlid': 'mail.mt_note',     # 🔑 internal note
+                    'attachment_ids': attachment_ids,
+                })
+            logger.info(f"Successfully posted comprehensive processing logs to sale order {sale_order_id} chatter")
+        except Exception as e:
+            logger.error(f"Failed to post message to sale order chatter: {str(e)}")
+
+        # Prepare response data
+        response_data = {
             'message': 'Odoo order processing finished',
             'product_id': product_id,
             'bom_id': bom_id,
             'updated_order_id': sale_order_id,
             'status': 'success'
-        })
+        }
+
+        # Log the route call to Odoo logging model
+        log_route_call(models, uid, '/handle-odoo-order', data, log_contents, response_data)
+
+        return jsonify(response_data)
 
     except Exception as e:
+        # Clean up log handler and get logs if available
+        log_contents = ""
+        try:
+            if 'log_handler' in locals() and 'log_capture_string' in locals():
+                log_contents = log_capture_string.getvalue()
+                logger.removeHandler(log_handler)
+                log_capture_string.close()
+        except:
+            pass
+
         logger.error(f"Error handling Odoo order: {str(e)}")
-        return jsonify({'error': str(e), 'status': 'error'}), 500
+
+        # Prepare error response data
+        error_response = {'error': str(e), 'status': 'error'}
+
+        # Log the error to Odoo logging model
+        # Use original data if available, otherwise use empty dict
+        request_data = data if 'data' in locals() else {}
+        log_route_call(None, None, '/handle-odoo-order', request_data, log_contents, error_response)
+
+        return jsonify(error_response), 500
 
 
