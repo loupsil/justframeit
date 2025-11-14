@@ -157,11 +157,16 @@ def get_uid():
         logger.error(f"Failed to authenticate with Odoo: {str(e)}")
         raise
 
-def generate_price_export_excel(models, uid):
+def generate_price_export_excel(models, uid, d3_formula=None):
     """
     Generate Excel file using the exact same logic as the Jupyter notebook.
     Creates a new Excel file with 3 tabs populated with Odoo data.
     Returns the Excel file as bytes, total products, total pricelists, and total duration rules.
+
+    Args:
+        models: Odoo models proxy
+        uid: Odoo user ID
+        d3_formula: Optional formula to set in tab 2, cell D3 (e.g., '=B4', '=B5', etc.)
     """
     try:
         logger.info("Starting Excel price-export generation using exact Jupyter notebook logic")
@@ -191,8 +196,9 @@ def generate_price_export_excel(models, uid):
                     'x_studio_associated_service',
                     'x_studio_associated_work_center',
                     'x_studio_associated_cost_per_employee_per_hour'
-                ]
-                # No limit - fetch all products
+                ],
+                # uncomment for testing with a limit
+                #'limit': 100
             }
         )
 
@@ -202,9 +208,64 @@ def generate_price_export_excel(models, uid):
         # =============================================
         # 📋 STEP 2: Create new Excel file from template
         # =============================================
-        # Use the empty template file (must be in the same directory as this script)
-        template_file = 'justframeit pricelist template empty.xlsx'
+        # Fetch template from Odoo x_configuration.x_studio_price_export_template field
+        logger.info("Fetching Excel template from Odoo x_configuration.x_studio_price_export_template")
+        config_ids = models.execute_kw(
+            ODOO_DB, uid, ODOO_API_KEY,
+            'x_configuration', 'search', [[]]
+        )
+
+        if not config_ids:
+            raise Exception("No x_configuration record found")
+
+        config_id = config_ids[0]
+        config_data = models.execute_kw(
+            ODOO_DB, uid, ODOO_API_KEY,
+            'x_configuration', 'read', [config_id], {
+                'fields': ['x_studio_price_export_template']
+            }
+        )
+
+        if not config_data or not config_data[0].get('x_studio_price_export_template'):
+            raise Exception("No template found in x_configuration.x_studio_price_export_template field")
+
+        # Decode the base64 template data
+        template_base64 = config_data[0]['x_studio_price_export_template']
+        logger.info(f"Raw template base64 data length: {len(template_base64) if template_base64 else 0} characters")
+
+        if not template_base64:
+            raise Exception("Template data from Odoo is empty")
+
+        try:
+            template_bytes = base64.b64decode(template_base64)
+            logger.info(f"Decoded template bytes length: {len(template_bytes)} bytes")
+        except Exception as e:
+            raise Exception(f"Failed to decode template base64 data from Odoo: {str(e)}")
+
+        if len(template_bytes) < 100:  # Basic sanity check for Excel file size
+            raise Exception(f"Template data from Odoo is suspiciously small ({len(template_bytes)} bytes), likely corrupted")
+
+        # Generate timestamp for filenames
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        # Save template to temporary file
+        template_file = f'temp_template_{timestamp}.xlsx'
+        with open(template_file, 'wb') as f:
+            f.write(template_bytes)
+        logger.info(f"Saved template from Odoo to temporary file: {template_file} ({len(template_bytes)} bytes)")
+
+        # Validate the template file can be loaded
+        try:
+            test_wb = load_workbook(template_file, read_only=True)
+            test_wb.close()
+            logger.info("Template file validation successful")
+        except Exception as e:
+            # Clean up the corrupted file
+            try:
+                os.remove(template_file)
+            except:
+                pass
+            raise Exception(f"Template file from Odoo is corrupted and cannot be loaded: {str(e)}")
         output_file = f'justframeit_pricelist_{timestamp}.xlsx'
 
         # Copy the template to create a new file
@@ -213,6 +274,18 @@ def generate_price_export_excel(models, uid):
 
         # Load the newly created Excel file
         wb = load_workbook(output_file)
+
+        # =============================================
+        # 📋 STEP 2.5: Modify D3 formula in TAB 2 if specified
+        # =============================================
+        if d3_formula is not None:
+            logger.info(f"Modifying D3 formula in tab 2 to: {d3_formula}")
+            if len(wb.sheetnames) > 1:
+                ws2 = wb.worksheets[1]
+                ws2['D3'] = d3_formula
+                logger.info("D3 formula modified successfully")
+            else:
+                logger.warning("Could not modify D3 formula - second tab not found")
 
         # =============================================
         # 📋 STEP 3: Fill TAB 1 with products
@@ -261,14 +334,22 @@ def generate_price_export_excel(models, uid):
         # =============================================
         logger.info("Fetching pricelists and filling TAB 2...")
 
-        pricelists = models.execute_kw(
+        # Fetch all pricelists and filter out "Default" in Python to avoid domain parsing issues
+        all_pricelists = models.execute_kw(
             ODOO_DB, uid, ODOO_API_KEY,
             'product.pricelist', 'search_read',
-            [[]],  # Empty domain = all pricelists
+            [],  # Empty domain = get all pricelists
             {
-                'fields': ['name', 'x_studio_price_discount']
+                'fields': ['name', 'x_studio_price_discount'],
+                'limit': 100  # Add limit to prevent excessive results
             }
         )
+
+        # Filter out pricelists named "Default" (case insensitive)
+        pricelists = [
+            p for p in all_pricelists
+            if p.get('name', '').lower() != 'default'
+        ]
 
         total_pricelists = len(pricelists)
         logger.info(f"Fetched {total_pricelists} pricelists")
@@ -374,12 +455,18 @@ def generate_price_export_excel(models, uid):
         with open(output_file, 'rb') as f:
             excel_bytes = f.read()
 
-        # Clean up the temporary file
+        # Clean up temporary files
+        try:
+            os.remove(template_file)
+            logger.info(f"Cleaned up temporary template file: {template_file}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up temporary template file {template_file}: {str(e)}")
+
         try:
             os.remove(output_file)
-            logger.info(f"Cleaned up temporary file: {output_file}")
+            logger.info(f"Cleaned up temporary output file: {output_file}")
         except Exception as e:
-            logger.warning(f"Failed to clean up temporary file {output_file}: {str(e)}")
+            logger.warning(f"Failed to clean up temporary output file {output_file}: {str(e)}")
 
         logger.info("Excel file generated successfully with all tabs populated")
 
@@ -567,6 +654,197 @@ def generate_csv_from_excel(excel_bytes):
         logger.error(f"Error generating CSV from Excel: {str(e)}")
         raise
 
+
+def process_pricelist_for_parallel(pricelist_name, pricelist_row, timestamp):
+    """
+    Process a single pricelist to generate its Excel file.
+    This function must be at module level to be pickleable for multiprocessing.
+    Establishes its own Odoo connection since connections cannot be pickled.
+    Returns Excel bytes - CSV conversion happens in main process due to xlwings limitations.
+    """
+    try:
+        logger.info(f"Processing pricelist '{pricelist_name}' at row {pricelist_row}")
+
+        # Calculate the formula for D3 (pointing to column B of this pricelist row)
+        d3_formula = f"=B{pricelist_row}"
+
+        # Establish new Odoo connection for this worker process
+        logger.info(f"Establishing Odoo connection for pricelist '{pricelist_name}'")
+        worker_uid = get_uid()
+        worker_models = get_odoo_models()
+        logger.info(f"Successfully connected to Odoo for pricelist '{pricelist_name}'")
+
+        # Add retry logic for Excel generation to handle transient errors
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Generating Excel for pricelist '{pricelist_name}' (attempt {attempt + 1}/{max_retries})")
+                # Generate Excel with modified D3 formula
+                modified_excel_bytes, _, _, _ = generate_price_export_excel(worker_models, worker_uid, d3_formula=d3_formula)
+                logger.info(f"Successfully generated Excel for pricelist '{pricelist_name}' ({len(modified_excel_bytes)} bytes)")
+                break  # Success, exit retry loop
+            except Exception as e:
+                logger.warning(f"Attempt {attempt + 1} failed for pricelist '{pricelist_name}': {str(e)}")
+                if attempt == max_retries - 1:  # Last attempt
+                    raise
+                # Wait before retry
+                import time
+                time.sleep(1)
+
+        # Return Excel bytes - CSV conversion will happen in main process
+        logger.info(f"Successfully generated Excel for pricelist '{pricelist_name}' - CSV conversion will happen in main process")
+
+        return (pricelist_name, modified_excel_bytes, timestamp)
+
+    except Exception as e:
+        logger.error(f"Error processing pricelist '{pricelist_name}': {str(e)}")
+        logger.error(f"Exception type: {type(e).__name__}")
+        import traceback
+        logger.error(f"Exception traceback: {traceback.format_exc()}")
+        raise
+
+def generate_csvs_from_pricelists(models, uid, original_excel_bytes, timestamp):
+    """
+    Generate CSV files by modifying D3 formula to point to different pricelists.
+    All pricelists are processed using the same logic with parallelization.
+
+    This function:
+    1. Loads the original Excel and reads pricelist names from tab 2, column A starting from row 3
+    2. For each pricelist, modifies D3 to point to that row's B column
+    3. Generates CSV from each modified Excel using parallel processing
+    4. Returns list of (pricelist_name, csv_bytes, csv_filename) tuples
+
+    Args:
+        models: Odoo models proxy
+        uid: Odoo user ID
+        original_excel_bytes: The original Excel file bytes
+        timestamp: Timestamp string for filename generation
+
+    Returns:
+        list: List of tuples (pricelist_name, csv_bytes, csv_filename)
+    """
+    try:
+        logger.info("Starting generation of CSVs from pricelists")
+
+        import tempfile
+
+        # Save original Excel bytes to temporary file for reading pricelist names
+        with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as temp_excel:
+            temp_excel.write(original_excel_bytes)
+            temp_excel_path = temp_excel.name
+
+        try:
+            # Load Excel to read pricelist names from tab 2
+            logger.info("Loading Excel to read pricelist names from tab 2")
+            wb = openpyxl.load_workbook(temp_excel_path, data_only=True)
+
+            if len(wb.sheetnames) < 2:
+                logger.warning("Second tab not found in workbook, cannot generate CSVs")
+                return []
+
+            ws2 = wb.worksheets[1]  # Second tab (pricelists)
+
+            # Read pricelist names from column A starting from row 3
+            pricelist_names = []
+            row = 3  # Start from row 3
+
+            logger.info("Reading pricelist names from tab 2, column A starting from row 3")
+
+            while row <= ws2.max_row:
+                cell_value = ws2[f'A{row}'].value
+                if cell_value is None or cell_value == '' or cell_value == 0:
+                    break  # Stop when we hit empty cells
+
+                pricelist_name = str(cell_value).strip()
+                logger.info(f"Found pricelist at row {row}: '{pricelist_name}'")
+
+                pricelist_names.append((pricelist_name, row))
+                logger.info(f"Added pricelist: '{pricelist_name}' at row {row}")
+
+                row += 1
+
+                # Limit to 5 pricelists to prevent excessive processing
+                if len(pricelist_names) >= 5:
+                    logger.info("Reached limit of 5 pricelists")
+                    break
+
+            wb.close()
+
+            logger.info(f"Found {len(pricelist_names)} pricelists to process")
+
+            # Generate CSV for each pricelist using parallel processing
+            from concurrent.futures import ProcessPoolExecutor
+
+            csvs = []
+            max_workers = min(len(pricelist_names), 5)  # Limit to 5 concurrent Excel processes
+
+            logger.info(f"Starting parallel processing of {len(pricelist_names)} pricelists with {max_workers} workers")
+
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all pricelist processing tasks and maintain order
+                futures = [
+                    executor.submit(process_pricelist_for_parallel, pricelist_name, pricelist_row, timestamp)
+                    for pricelist_name, pricelist_row in pricelist_names
+                ]
+
+                logger.info(f"Submitted {len(futures)} pricelist Excel generation tasks to executor")
+
+                # Collect Excel results from parallel processing
+                excel_results = []
+                completed_count = 0
+                for future in futures:
+                    try:
+                        result = future.result()
+                        completed_count += 1
+                        pricelist_name, excel_bytes, result_timestamp = result
+                        logger.info(f"Completed Excel generation for pricelist '{pricelist_name}' ({completed_count}/{len(futures)})")
+                        excel_results.append((pricelist_name, excel_bytes, result_timestamp))
+                    except Exception as exc:
+                        # Get the pricelist name from the failed future (need to find which one it was)
+                        pricelist_name = "unknown"
+                        for i, f in enumerate(futures):
+                            if f == future:
+                                pricelist_name = pricelist_names[i][0]
+                                break
+                        logger.error(f'Pricelist {pricelist_name} generated an exception: {str(exc)}')
+                        logger.error(f'Exception type: {type(exc).__name__}')
+                        import traceback
+                        logger.error(f'Exception traceback: {traceback.format_exc()}')
+                        raise  # Re-raise to fail the entire operation
+
+            logger.info(f"Parallel Excel generation completed - processed {completed_count} tasks")
+
+            # Now convert Excel files to CSV in main process (xlwings can only work in main process)
+            logger.info("Converting Excel files to CSV in main process...")
+            for pricelist_name, excel_bytes, result_timestamp in excel_results:
+                try:
+                    logger.info(f"Converting Excel to CSV for pricelist '{pricelist_name}'")
+                    csv_bytes = generate_csv_from_excel(excel_bytes)
+                    csv_filename = f"justframeit_price_export_pricelist_{pricelist_name.replace(' ', '_').lower()}_{result_timestamp}.csv"
+                    logger.info(f"Successfully converted Excel to CSV for pricelist '{pricelist_name}'")
+                    csvs.append((pricelist_name, csv_bytes, csv_filename))
+                except Exception as e:
+                    logger.error(f"Error converting Excel to CSV for pricelist '{pricelist_name}': {str(e)}")
+                    raise
+
+            logger.info(f"CSV conversion completed - generated {len(csvs)} CSV files")
+            return csvs
+
+        finally:
+            # Clean up temporary file
+            try:
+                os.remove(temp_excel_path)
+                logger.info(f"Cleaned up temporary Excel file: {temp_excel_path}")
+            except Exception as e:
+                logger.warning(f"Could not remove temporary Excel file: {e}")
+
+    except Exception as e:
+        logger.error(f"Error generating CSVs from pricelists: {str(e)}")
+        logger.error(f"Exception type: {type(e).__name__}")
+        import traceback
+        logger.error(f"Exception traceback: {traceback.format_exc()}")
+        raise
+
 @price_export_bp.route('/generate-price-export', methods=['POST'])
 def generate_price_export():
     """
@@ -606,10 +884,25 @@ def generate_price_export():
         excel_bytes, total_products, total_pricelists, source_file = generate_price_export_excel(models, uid)
 
 
-        # Generate CSV from the Excel data
-        logger.info("Generating CSV from Excel data for x_studio_price_list_1_csv")
-        csv_bytes = generate_csv_from_excel(excel_bytes)
+        # Generate all pricelist-based CSVs using uniform logic
+        logger.info("Generating pricelist-based CSV files")
 
+        all_pricelist_csvs = generate_csvs_from_pricelists(models, uid, excel_bytes, timestamp)
+
+        logger.info(f"Generated {len(all_pricelist_csvs)} pricelist-based CSV files")
+
+        # All CSVs follow the same process - no distinction between main and additional
+        if all_pricelist_csvs:
+            # Use the first CSV as the primary one for backward compatibility
+            csv_bytes, csv_filename = all_pricelist_csvs[0][1], all_pricelist_csvs[0][2]
+            # All CSVs are treated equally for storage
+            additional_csvs = all_pricelist_csvs
+        else:
+            # Fallback: if no pricelists found, generate a basic CSV (though this shouldn't happen)
+            logger.warning("No pricelist CSVs generated, falling back to basic CSV generation")
+            csv_bytes = generate_csv_from_excel(excel_bytes)
+            csv_filename = f"justframeit_price_export_fallback_{timestamp}.csv"
+            additional_csvs = []
 
         # Find the x_configuration record to update
         logger.info("Finding x_configuration record")
@@ -630,16 +923,39 @@ def generate_price_export():
 
         # Encode CSV bytes to base64 for Odoo binary field
         csv_base64 = base64.b64encode(csv_bytes).decode('ascii')
-        csv_filename = f"justframeit_price_export_generated_{timestamp}.csv"
+        # csv_filename is already set from the pricelist processing above (uses pricelist-based naming)
 
-        # Update the x_configuration record with the Excel file and CSV
-        logger.info(f"Saving Excel file to x_studio_price_list_1 field and CSV to x_studio_price_list_1_csv")
+        # Prepare update values for Excel and primary CSV
         update_vals = {
             'x_studio_price_list_1': excel_base64,
             'x_studio_price_list_1_filename': filename,
             'x_studio_price_list_1_csv': csv_base64,
             'x_studio_price_list_1_csv_filename': csv_filename,
         }
+
+        # Add CSV fields for each pricelist (all treated equally)
+        # Note: The first CSV is already set above in update_vals, so we skip it in the loop
+        additional_csv_info = []
+        # First, add all CSVs to additional_csv_info for chatter message (including the first one)
+        for i, (pricelist_name, csv_bytes_data, csv_filename_data) in enumerate(additional_csvs):
+            csv_field_num = i + 1  # Field 1, 2, 3, etc.
+            additional_csv_info.append({
+                'pricelist_name': pricelist_name,
+                'field': f'x_studio_price_list_{csv_field_num}_csv',
+                'filename': csv_filename_data
+            })
+
+        # Now save to database, but skip the first CSV since it's already saved above
+        for i, (pricelist_name, csv_bytes_data, csv_filename_data) in enumerate(additional_csvs[1:], start=1):  # Skip first CSV
+            csv_field_num = i + 1  # Field 2, 3, 4, etc.
+            csv_base64_data = base64.b64encode(csv_bytes_data).decode('ascii')
+
+            update_vals[f'x_studio_price_list_{csv_field_num}_csv'] = csv_base64_data
+            update_vals[f'x_studio_price_list_{csv_field_num}_csv_filename'] = csv_filename_data
+
+            logger.info(f"Added CSV for pricelist '{pricelist_name}' to field x_studio_price_list_{csv_field_num}_csv")
+
+        logger.info(f"Saving Excel file to x_studio_price_list_1 and {len(additional_csvs)} additional CSV files to Odoo")
 
         models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
             'x_configuration', 'write', [config_id, update_vals])
@@ -666,7 +982,7 @@ def generate_price_export():
         attachment_ids.append(excel_attachment_id)
         logger.info(f"Created Excel attachment with ID: {excel_attachment_id}")
 
-        # Create CSV attachment
+        # Create primary CSV attachment
         csv_attachment_data = {
             'name': csv_filename,
             'type': 'binary',
@@ -678,7 +994,23 @@ def generate_price_export():
         csv_attachment_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
             'ir.attachment', 'create', [csv_attachment_data])
         attachment_ids.append(csv_attachment_id)
-        logger.info(f"Created CSV attachment with ID: {csv_attachment_id}")
+        logger.info(f"Created primary CSV attachment with ID: {csv_attachment_id}")
+
+        # Create attachments for additional CSV files
+        for pricelist_name, csv_bytes_data, csv_filename_data in additional_csvs:
+            csv_base64_data = base64.b64encode(csv_bytes_data).decode('ascii')
+            csv_attachment_data = {
+                'name': csv_filename_data,
+                'type': 'binary',
+                'datas': csv_base64_data,
+                'res_model': 'x_configuration',
+                'res_id': config_id,
+                'mimetype': 'text/csv'
+            }
+            csv_attachment_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                'ir.attachment', 'create', [csv_attachment_data])
+            attachment_ids.append(csv_attachment_id)
+            logger.info(f"Created CSV attachment for pricelist '{pricelist_name}' with ID: {csv_attachment_id}")
 
         # Get captured logs and create log attachment
         captured_logs = log_capture_string.getvalue()
@@ -698,19 +1030,19 @@ def generate_price_export():
 
         # Prepare response
         response_data = {
-            'message': 'Price-export Excel and CSV generated, saved locally, and saved to Odoo successfully',
+            'message': f'Price-export Excel and {len(additional_csvs) + 1} CSV files generated and saved to Odoo successfully',
             'config_id': config_id,
             'filename': filename,
             'csv_filename': csv_filename,
-            'local_filename': local_filename,
-            'local_csv_filename': local_csv_filename,
+            'additional_csvs': additional_csv_info,
+            'total_csv_files': len(additional_csvs) + 1,
             'products_processed': total_products,
             'pricelists_processed': total_pricelists,
             'source_file': source_file,
             'status': 'success'
         }
 
-        logger.info(f"Price-export generation completed - Config ID: {config_id}, Products: {total_products}, Pricelists: {total_pricelists}")
+        logger.info(f"Price-export generation completed - Config ID: {config_id}, Products: {total_products}, Pricelists: {total_pricelists}, CSV files: {len(additional_csvs) + 1}")
 
         # Get captured logs and clean up handler
         log_contents = log_capture_string.getvalue()
@@ -721,15 +1053,69 @@ def generate_price_export():
         request_data = {}  # Empty payload since this route takes no input
         log_route_call(models, uid, '/generate-price-export', request_data, log_contents, response_data)
 
-        # Create simple chatter message with response data
-        response_formatted = json.dumps(response_data, indent=2, ensure_ascii=False)
-        chatter_message = f"✅ Price-export generation completed\n\n📤 Response:\n```\n{response_formatted}\n```"
+        # Create comprehensive HTML chatter message with all logs and final return
+        csv_list_items = []
+        # All CSVs are now generated equally - no "main" distinction
+        for csv_info in additional_csv_info:
+            csv_list_items.append(f"<li>Pricelist '{csv_info['pricelist_name']}': {csv_info['filename']}</li>")
+
+        attachment_list = [f"price_export_logs_{timestamp}.txt", filename]
+        # All CSV files are in additional_csv_info now
+        attachment_list.extend([csv['filename'] for csv in additional_csv_info])
+        attachment_items = ", ".join(attachment_list)
+
+        chatter_message = f"""<p><strong>✅ Price-Export Generation Completed Successfully</strong></p>
+
+
+<p><strong>📝 Processing Details:</strong></p>
+
+<p><strong>Data Retrieval:</strong></p>
+<ul>
+<li>Fetched {total_products} products from Odoo</li>
+<li>Retrieved {total_pricelists} pricelists</li>
+<li>Processed duration rules data</li>
+</ul>
+
+<p><strong>Template Processing:</strong></p>
+<ul>
+<li>Loaded Excel template from configuration</li>
+<li>Applied product and pricing data</li>
+<li>Generated main Excel file: {filename}</li>
+</ul>
+
+<p><strong>CSV Generation:</strong></p>
+<ul>
+<li>Created {len(additional_csvs) + 1} CSV files total</li>
+</ul>
+
+<p><strong>Generated CSV Files:</strong></p>
+<ul>{''.join(csv_list_items)}</ul>
+
+<p><strong>File Storage:</strong></p>
+<ul>
+<li>All files saved to Odoo configuration record</li>
+<li>Log files created for debugging and audit trail</li>
+</ul>
+
+<p><strong>Final Return Data:</strong></p>
+<ul>
+<li>message: '{response_data['message']}'</li>
+<li>config_id: {config_id}</li>
+<li>filename: '{filename}'</li>
+<li>csv_filename: '{csv_filename}'</li>
+<li>total_csv_files: {len(additional_csvs) + 1}</li>
+<li>products_processed: {total_products}</li>
+<li>pricelists_processed: {total_pricelists}</li>
+<li>status: 'success'</li>
+</ul>"""
 
         # Post message to chatter
         chatter_data = {
             'body': chatter_message,
+            'body_is_html': True,                # keep HTML rendering
             'message_type': 'comment',
-            'attachment_ids': attachment_ids,  # List of attachment IDs directly
+            'subtype_xmlid': 'mail.mt_note',     # 🔑 internal note
+            'attachment_ids': attachment_ids,
         }
 
         models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
@@ -751,6 +1137,9 @@ def generate_price_export():
             pass
 
         logger.error(f"Error in generate-price-export route: {str(e)}")
+        logger.error(f"Exception type: {type(e).__name__}")
+        import traceback
+        logger.error(f"Exception traceback: {traceback.format_exc()}")
 
         # Prepare error response data
         error_response = {'error': str(e), 'status': 'error'}
