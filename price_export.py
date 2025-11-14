@@ -982,21 +982,7 @@ def generate_price_export():
         attachment_ids.append(excel_attachment_id)
         logger.info(f"Created Excel attachment with ID: {excel_attachment_id}")
 
-        # Create primary CSV attachment
-        csv_attachment_data = {
-            'name': csv_filename,
-            'type': 'binary',
-            'datas': csv_base64,
-            'res_model': 'x_configuration',
-            'res_id': config_id,
-            'mimetype': 'text/csv'
-        }
-        csv_attachment_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-            'ir.attachment', 'create', [csv_attachment_data])
-        attachment_ids.append(csv_attachment_id)
-        logger.info(f"Created primary CSV attachment with ID: {csv_attachment_id}")
-
-        # Create attachments for additional CSV files
+        # Create attachments for all CSV files (all treated equally now)
         for pricelist_name, csv_bytes_data, csv_filename_data in additional_csvs:
             csv_base64_data = base64.b64encode(csv_bytes_data).decode('ascii')
             csv_attachment_data = {
