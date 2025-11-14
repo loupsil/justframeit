@@ -2,6 +2,7 @@ from flask import Flask, send_from_directory, Response, render_template, redirec
 from dotenv import load_dotenv
 import os
 from justframeit import justframeit_bp
+from price_export import price_export_bp
 
 # Load environment variables from .env file
 load_dotenv()
@@ -10,6 +11,7 @@ app = Flask(__name__)
 
 # Register blueprints
 app.register_blueprint(justframeit_bp)
+app.register_blueprint(price_export_bp)
 
 @app.route('/')
 def index():
