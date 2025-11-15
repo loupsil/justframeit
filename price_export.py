@@ -854,21 +854,38 @@ def generate_price_export():
     1. Fetches Excel template from x_configuration record ID 1, field x_studio_price_export_template
     2. Processes the template using the exact code from the Jupyter notebook
     3. Saves the generated Excel file to Odoo's x_configuration.x_studio_price_list_1 binary field
-    4. Generates CSV from the Excel data using the same logic as the Jupyter notebook
+    4. Generates CSV from the Excel data using the same logic as the Jupyter notebook (if x_studio_is_run_locally is true)
     5. Saves the generated CSV file to Odoo's x_configuration.x_studio_price_list_1_csv binary field
     6. Returns success/failure status
 
-    Simple POST request with empty body to trigger:
+    POST request with payload containing x_studio_is_run_locally flag:
     POST /generate-price-export
     Content-Type: application/json
-    {}
+    {
+        "_action": "CUSTOM - Product Price Export Trigger(#969)",
+        "_id": 1,
+        "_model": "x_configuration",
+        "id": 1,
+        "x_studio_is_run_locally": false
+    }
     """
     try:
+        # Get the request payload
+        payload = request.get_json() or {}
+        x_studio_is_run_locally = payload.get('x_studio_is_run_locally', True)  # Default to True if not specified
+
         # Set up log capture
         log_handler, log_capture_string = create_log_capture_handler()
         logger.addHandler(log_handler)
 
         logger.info("Starting price-export generation route")
+        logger.info(f"Payload received: {json.dumps(payload, indent=2)}")
+        logger.info(f"x_studio_is_run_locally: {x_studio_is_run_locally}")
+
+        if not x_studio_is_run_locally:
+            logger.info("x_studio_is_run_locally is false - CSV generation will be skipped")
+        else:
+            logger.info("x_studio_is_run_locally is true - CSV generation will proceed")
 
         # Get Odoo connection
         logger.info("Connecting to Odoo")
@@ -883,13 +900,14 @@ def generate_price_export():
         logger.info("Generating Excel price-export file")
         excel_bytes, total_products, total_pricelists, source_file = generate_price_export_excel(models, uid)
 
-
-        # Generate all pricelist-based CSVs using uniform logic
-        logger.info("Generating pricelist-based CSV files")
-
-        all_pricelist_csvs = generate_csvs_from_pricelists(models, uid, excel_bytes, timestamp)
-
-        logger.info(f"Generated {len(all_pricelist_csvs)} pricelist-based CSV files")
+        # Generate all pricelist-based CSVs using uniform logic (only if x_studio_is_run_locally is true)
+        if x_studio_is_run_locally:
+            logger.info("Generating pricelist-based CSV files")
+            all_pricelist_csvs = generate_csvs_from_pricelists(models, uid, excel_bytes, timestamp)
+            logger.info(f"Generated {len(all_pricelist_csvs)} pricelist-based CSV files")
+        else:
+            logger.info("Skipping CSV generation as x_studio_is_run_locally is false")
+            all_pricelist_csvs = []
 
         # All CSVs follow the same process - no distinction between main and additional
         if all_pricelist_csvs:
@@ -898,10 +916,17 @@ def generate_price_export():
             # All CSVs are treated equally for storage
             additional_csvs = all_pricelist_csvs
         else:
-            # Fallback: if no pricelists found, generate a basic CSV (though this shouldn't happen)
-            logger.warning("No pricelist CSVs generated, falling back to basic CSV generation")
-            csv_bytes = generate_csv_from_excel(excel_bytes)
-            csv_filename = f"justframeit_price_export_fallback_{timestamp}.csv"
+            # Handle case where CSV generation was skipped or no pricelists found
+            if x_studio_is_run_locally:
+                # Fallback: if no pricelists found, generate a basic CSV (though this shouldn't happen)
+                logger.warning("No pricelist CSVs generated, falling back to basic CSV generation")
+                csv_bytes = generate_csv_from_excel(excel_bytes)
+                csv_filename = f"justframeit_price_export_fallback_{timestamp}.csv"
+            else:
+                # CSV generation was intentionally skipped
+                logger.info("CSV generation was skipped as per x_studio_is_run_locally flag")
+                csv_bytes = None
+                csv_filename = None
             additional_csvs = []
 
         # Find the x_configuration record to update
@@ -921,17 +946,21 @@ def generate_price_export():
         # Encode Excel bytes to base64 for Odoo binary field
         excel_base64 = base64.b64encode(excel_bytes).decode('ascii')
 
-        # Encode CSV bytes to base64 for Odoo binary field
-        csv_base64 = base64.b64encode(csv_bytes).decode('ascii')
-        # csv_filename is already set from the pricelist processing above (uses pricelist-based naming)
-
-        # Prepare update values for Excel and primary CSV
+        # Prepare update values for Excel
         update_vals = {
             'x_studio_price_list_1': excel_base64,
             'x_studio_price_list_1_filename': filename,
-            'x_studio_price_list_1_csv': csv_base64,
-            'x_studio_price_list_1_csv_filename': csv_filename,
         }
+
+        # Only add CSV fields if CSV was generated
+        if csv_bytes is not None and csv_filename is not None:
+            # Encode CSV bytes to base64 for Odoo binary field
+            csv_base64 = base64.b64encode(csv_bytes).decode('ascii')
+            update_vals['x_studio_price_list_1_csv'] = csv_base64
+            update_vals['x_studio_price_list_1_csv_filename'] = csv_filename
+            logger.info("Including CSV data in update values")
+        else:
+            logger.info("Skipping CSV fields in update values as CSV generation was not performed")
 
         # Add CSV fields for each pricelist (all treated equally)
         # Note: The first CSV is already set above in update_vals, so we skip it in the loop
@@ -1015,20 +1044,28 @@ def generate_price_export():
         logger.info(f"Created log attachment with ID: {log_attachment_id}")
 
         # Prepare response
+        if csv_bytes is not None:
+            csv_files_count = len(additional_csvs) + 1
+            message = f'Price-export Excel and {csv_files_count} CSV files generated and saved to Odoo successfully'
+        else:
+            csv_files_count = 0
+            message = 'Price-export Excel generated and saved to Odoo successfully (CSV generation skipped)'
+
         response_data = {
-            'message': f'Price-export Excel and {len(additional_csvs) + 1} CSV files generated and saved to Odoo successfully',
+            'message': message,
             'config_id': config_id,
             'filename': filename,
             'csv_filename': csv_filename,
             'additional_csvs': additional_csv_info,
-            'total_csv_files': len(additional_csvs) + 1,
+            'total_csv_files': csv_files_count,
             'products_processed': total_products,
             'pricelists_processed': total_pricelists,
             'source_file': source_file,
+            'x_studio_is_run_locally': x_studio_is_run_locally,
             'status': 'success'
         }
 
-        logger.info(f"Price-export generation completed - Config ID: {config_id}, Products: {total_products}, Pricelists: {total_pricelists}, CSV files: {len(additional_csvs) + 1}")
+        logger.info(f"Price-export generation completed - Config ID: {config_id}, Products: {total_products}, Pricelists: {total_pricelists}, CSV files: {csv_files_count}")
 
         # Get captured logs and clean up handler
         log_contents = log_capture_string.getvalue()
@@ -1036,18 +1073,21 @@ def generate_price_export():
         log_capture_string.close()
 
         # Log the route call to Odoo logging model
-        request_data = {}  # Empty payload since this route takes no input
-        log_route_call(models, uid, '/generate-price-export', request_data, log_contents, response_data)
+        log_route_call(models, uid, '/generate-price-export', payload, log_contents, response_data)
 
         # Create comprehensive HTML chatter message with all logs and final return
         csv_list_items = []
-        # All CSVs are now generated equally - no "main" distinction
-        for csv_info in additional_csv_info:
-            csv_list_items.append(f"<li>Pricelist '{csv_info['pricelist_name']}': {csv_info['filename']}</li>")
+        if csv_bytes is not None:
+            # All CSVs are now generated equally - no "main" distinction
+            for csv_info in additional_csv_info:
+                csv_list_items.append(f"<li>Pricelist '{csv_info['pricelist_name']}': {csv_info['filename']}</li>")
+        else:
+            csv_list_items.append("<li>CSV generation was skipped (x_studio_is_run_locally = false)</li>")
 
         attachment_list = [f"price_export_logs_{timestamp}.txt", filename]
-        # All CSV files are in additional_csv_info now
-        attachment_list.extend([csv['filename'] for csv in additional_csv_info])
+        if csv_bytes is not None:
+            # All CSV files are in additional_csv_info now
+            attachment_list.extend([csv['filename'] for csv in additional_csv_info])
         attachment_items = ", ".join(attachment_list)
 
         chatter_message = f"""<p><strong>✅ Price-Export Generation Completed Successfully</strong></p>
@@ -1071,7 +1111,8 @@ def generate_price_export():
 
 <p><strong>CSV Generation:</strong></p>
 <ul>
-<li>Created {len(additional_csvs) + 1} CSV files total</li>
+<li>Created {csv_files_count} CSV files total</li>
+<li>x_studio_is_run_locally: {x_studio_is_run_locally}</li>
 </ul>
 
 <p><strong>Generated CSV Files:</strong></p>
@@ -1089,9 +1130,10 @@ def generate_price_export():
 <li>config_id: {config_id}</li>
 <li>filename: '{filename}'</li>
 <li>csv_filename: '{csv_filename}'</li>
-<li>total_csv_files: {len(additional_csvs) + 1}</li>
+<li>total_csv_files: {csv_files_count}</li>
 <li>products_processed: {total_products}</li>
 <li>pricelists_processed: {total_pricelists}</li>
+<li>x_studio_is_run_locally: {x_studio_is_run_locally}</li>
 <li>status: 'success'</li>
 </ul>"""
 
@@ -1131,7 +1173,6 @@ def generate_price_export():
         error_response = {'error': str(e), 'status': 'error'}
 
         # Log the error to Odoo logging model
-        request_data = {}  # Empty payload since this route takes no input
-        log_route_call(None, None, '/generate-price-export', request_data, log_contents, error_response)
+        log_route_call(None, None, '/generate-price-export', payload, log_contents, error_response)
 
         return jsonify(error_response), 500
