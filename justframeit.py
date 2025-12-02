@@ -277,6 +277,15 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
     product_tmpl_id = product_data[0]['product_tmpl_id'][0]
     logger.debug(f"Product template ID: {product_tmpl_id}")
 
+    # Set route_ids for finished products (MTO and Manufacturing, exclude Buy)
+    logger.info("Setting route_ids for finished product (MTO and Manufacturing)")
+    models.execute_kw(
+        ODOO_DB, uid, ODOO_API_KEY,
+        'product.template', 'write',
+        [[product_tmpl_id], {'route_ids': [(6, 0, [1, 4])]}]  # 1=MTO, 4=Manufacture
+    )
+    logger.info("Successfully set route_ids to [1, 4] (MTO and Manufacturing)")
+
     # Create Bill of Materials using the template ID
     logger.info("Creating Bill of Materials")
     logger.info(f"BOM components: {len(bom_components)}")
