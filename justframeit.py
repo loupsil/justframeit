@@ -327,8 +327,13 @@ def interpret_craft_payload(craft_payload):
         address_type = "shipping" if shipping_address else "billing"
         logger.info(f"Using {address_type} address for customer details")
 
+        # Extract customer name with fallback to address fullName if customer name is missing
+        customer_name = customer_data.get('fullName')
+        if not customer_name:
+            customer_name = address.get('fullName', '')
+
         customer = {
-            'name': customer_data.get('fullName', ''),
+            'name': customer_name,
             'email': customer_data.get('email', ''),
             'phone': customer_data.get('userPhone') or address.get('phone', ''),
             'street': f"{address.get('addressLine1', '')} {address.get('addressLine2', '')}".strip(),
