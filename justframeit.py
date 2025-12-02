@@ -834,142 +834,182 @@ def handle_odoo_order():
 
         logger.info(f"Found sale order with {len(sale_order[0]['order_line'])} order lines")
 
-        # Get first product from sale order
-        logger.info("Reading order line details")
-        order_line = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-            'sale.order.line', 'read',
-            [sale_order[0]['order_line'][0]],
-            {'fields': ['product_id', 'price_unit']})
+        # Process all order lines
+        order_line_ids = sale_order[0]['order_line']
+        processed_lines = []  # Track all processed line results
 
-        product_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-            'product.product', 'read',
-            [order_line[0]['product_id'][0]],
-            {'fields': ['x_studio_width', 'x_studio_height', 'name', 'default_code', 'product_tmpl_id']})
+        for line_index, order_line_id in enumerate(order_line_ids):
+            logger.info(f"--- Processing order line {line_index + 1}/{len(order_line_ids)} (ID: {order_line_id}) ---")
 
-        # Extract product details
-        width = product_info[0]['x_studio_width']
-        height = product_info[0]['x_studio_height']
-        price = order_line[0]['price_unit']
+            # Get order line details
+            logger.info("Reading order line details")
+            order_line = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                'sale.order.line', 'read',
+                [order_line_id],
+                {'fields': ['product_id', 'price_unit']})
 
-        logger.info(f"Extracted product specs: {width}mm x {height}mm, €{price}")
-        logger.info(f"Original product: {product_info[0]['name']} ({product_info[0]['default_code']})")
-
-        # Get BOM for the existing product
-        logger.info("Finding BOM for existing product")
-        bom_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-            'mrp.bom', 'search',
-            [[['product_tmpl_id', '=', product_info[0]['product_tmpl_id'][0]]]])
-
-        if not bom_ids:
-            logger.error("No BOM found for the existing product")
-            return jsonify({'error': 'No BOM found for the existing product'}), 404
-
-        logger.info(f"Found BOM ID: {bom_ids[0]}")
-
-        bom_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-            'mrp.bom', 'read',
-            [bom_ids[0]],
-            {'fields': ['bom_line_ids']})
-
-        # Get components from existing BOM
-        logger.info("Copying components from existing BOM")
-        components = []
-        for bom_line_id in bom_info[0]['bom_line_ids']:
-            bom_line = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                'mrp.bom.line', 'read',
-                [bom_line_id],
-                {'fields': ['product_id']})
-            component_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+            product_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
                 'product.product', 'read',
-                [bom_line[0]['product_id'][0]],
-                {'fields': ['name', 'default_code']})
-            components.append({
-                'name': component_info[0]['name'],
-                'reference': component_info[0]['default_code']
+                [order_line[0]['product_id'][0]],
+                {'fields': ['x_studio_width', 'x_studio_height', 'name', 'default_code', 'product_tmpl_id']})
+
+            # Extract product details
+            width = product_info[0]['x_studio_width']
+            height = product_info[0]['x_studio_height']
+            price = order_line[0]['price_unit']
+            original_product_name = product_info[0]['name']
+            original_product_code = product_info[0]['default_code']
+
+            logger.info(f"Extracted product specs: {width}mm x {height}mm, €{price}")
+            logger.info(f"Original product: {original_product_name} ({original_product_code})")
+
+            # Get BOM for the existing product
+            logger.info("Finding BOM for existing product")
+            bom_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                'mrp.bom', 'search',
+                [[['product_tmpl_id', '=', product_info[0]['product_tmpl_id'][0]]]])
+
+            if not bom_ids:
+                logger.warning(f"No BOM found for product '{original_product_name}' - skipping this line")
+                processed_lines.append({
+                    'order_line_id': order_line_id,
+                    'original_product': original_product_name,
+                    'status': 'skipped',
+                    'reason': 'No BOM found'
+                })
+                continue
+
+            logger.info(f"Found BOM ID: {bom_ids[0]}")
+
+            bom_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                'mrp.bom', 'read',
+                [bom_ids[0]],
+                {'fields': ['bom_line_ids']})
+
+            # Get components from existing BOM
+            logger.info("Copying components from existing BOM")
+            components = []
+            for bom_line_id in bom_info[0]['bom_line_ids']:
+                bom_line = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                    'mrp.bom.line', 'read',
+                    [bom_line_id],
+                    {'fields': ['product_id']})
+                component_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                    'product.product', 'read',
+                    [bom_line[0]['product_id'][0]],
+                    {'fields': ['name', 'x_studio_product_code']})
+                components.append({
+                    'name': component_info[0]['name'],
+                    'reference': component_info[0]['x_studio_product_code']
+                })
+                logger.debug(f"Copied component: {component_info[0]['name']} ({component_info[0]['x_studio_product_code']})")
+
+            logger.info(f"Copied {len(components)} components from existing BOM")
+
+            # Generate timestamp for unique naming (include line index for uniqueness)
+            logger.info("Generating timestamp for new product naming")
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            unique_suffix = f"{timestamp}_{line_index + 1}"
+
+            # Create new product name and reference with timestamp
+            product_name = f"Finished Product {unique_suffix}"
+            product_reference = f"FINISHED_PRODUCT_{unique_suffix}"
+            logger.info(f"New product name: {product_name}")
+            logger.info(f"New product reference: {product_reference}")
+
+            # Use shared function to create product and BOM
+            logger.info("Creating new product and BOM")
+            product_id, bom_id, bom_components_count, bom_operations_count = create_product_and_bom(
+                models, uid,
+                product_name, product_reference,
+                width, height, price, components
+            )
+
+            # Compute BOM cost for the newly created product
+            logger.info("Computing BOM cost for new product")
+            initial_cost = 0
+            new_cost = 0
+            # Note: button_bom_cost method raises an exception as expected behavior
+            try:
+                # Get the product template ID from the created product
+                product_data = models.execute_kw(
+                    ODOO_DB, uid, ODOO_API_KEY,
+                    'product.product', 'read', [product_id], {'fields': ['product_tmpl_id']}
+                )
+                product_tmpl_id = product_data[0]['product_tmpl_id'][0]
+
+                # Get initial cost before computing BOM
+                initial_cost = models.execute_kw(
+                    ODOO_DB, uid, ODOO_API_KEY,
+                    'product.template', 'read',
+                    [[product_tmpl_id]],
+                    {'fields': ['standard_price']}
+                )[0]['standard_price']
+
+                logger.info(f"Initial cost: €{initial_cost}")
+
+                # Compute BOM cost - method raises exception as expected
+                models.execute_kw(
+                    ODOO_DB, uid, ODOO_API_KEY,
+                    'product.template', 'button_bom_cost',
+                    [[product_tmpl_id]]
+                )
+
+                # Get new cost after computation
+                new_cost = models.execute_kw(
+                    ODOO_DB, uid, ODOO_API_KEY,
+                    'product.template', 'read',
+                    [[product_tmpl_id]],
+                    {'fields': ['standard_price']}
+                )[0]['standard_price']
+
+                logger.info(f"New cost after BOM computation: €{new_cost}")
+
+                if new_cost != initial_cost:
+                    logger.info("Cost change detected - BOM computation successful")
+                else:
+                    logger.info("No cost change detected after BOM computation")
+
+            except Exception as e:
+                # This exception is expected - the method completes successfully despite raising it
+                logger.info(f"BOM cost computation completed for Product Template ID {product_tmpl_id}")
+
+            # Update existing sale order line with new product
+            logger.info(f"Updating order line {order_line_id} with new product")
+            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                'sale.order', 'write',
+                [sale_order_id, {
+                    'order_line': [(1, order_line_id, {
+                        'product_id': product_id,
+                        'product_uom_qty': 1,
+                        'price_unit': price
+                    })]
+                }])
+            logger.info(f"Order line {order_line_id} updated successfully")
+
+            # Track processed line results
+            processed_lines.append({
+                'order_line_id': order_line_id,
+                'original_product': original_product_name,
+                'original_product_code': original_product_code,
+                'new_product_id': product_id,
+                'new_product_name': product_name,
+                'new_product_reference': product_reference,
+                'bom_id': bom_id,
+                'width': width,
+                'height': height,
+                'price': price,
+                'components': components,
+                'bom_components_count': bom_components_count,
+                'bom_operations_count': bom_operations_count,
+                'initial_cost': initial_cost,
+                'new_cost': new_cost,
+                'status': 'success'
             })
-            logger.debug(f"Copied component: {component_info[0]['name']} ({component_info[0]['default_code']})")
 
-        logger.info(f"Copied {len(components)} components from existing BOM")
+            logger.info(f"--- Completed processing order line {line_index + 1}/{len(order_line_ids)} ---")
 
-        # Generate timestamp for unique naming
-        logger.info("Generating timestamp for new product naming")
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-
-        # Create new product name and reference with timestamp
-        product_name = f"Finished Product {timestamp}"
-        product_reference = f"FINISHED_PRODUCT_{timestamp}"
-        logger.info(f"New product name: {product_name}")
-        logger.info(f"New product reference: {product_reference}")
-
-        # Use shared function to create product and BOM
-        logger.info("Creating new product and BOM")
-        product_id, bom_id, _, _ = create_product_and_bom(
-            models, uid,
-            product_name, product_reference,
-            width, height, price, components
-        )
-
-        # Compute BOM cost for the newly created product
-        logger.info("Computing BOM cost for new product")
-        # Note: button_bom_cost method raises an exception as expected behavior
-        try:
-            # Get the product template ID from the created product
-            product_data = models.execute_kw(
-                ODOO_DB, uid, ODOO_API_KEY,
-                'product.product', 'read', [product_id], {'fields': ['product_tmpl_id']}
-            )
-            product_tmpl_id = product_data[0]['product_tmpl_id'][0]
-
-            # Get initial cost before computing BOM
-            initial_cost = models.execute_kw(
-                ODOO_DB, uid, ODOO_API_KEY,
-                'product.template', 'read',
-                [[product_tmpl_id]],
-                {'fields': ['standard_price']}
-            )[0]['standard_price']
-
-            logger.info(f"Initial cost: €{initial_cost}")
-
-            # Compute BOM cost - method raises exception as expected
-            models.execute_kw(
-                ODOO_DB, uid, ODOO_API_KEY,
-                'product.template', 'button_bom_cost',
-                [[product_tmpl_id]]
-            )
-
-            # Get new cost after computation
-            new_cost = models.execute_kw(
-                ODOO_DB, uid, ODOO_API_KEY,
-                'product.template', 'read',
-                [[product_tmpl_id]],
-                {'fields': ['standard_price']}
-            )[0]['standard_price']
-
-            logger.info(f"New cost after BOM computation: €{new_cost}")
-
-            if new_cost != initial_cost:
-                logger.info("Cost change detected - BOM computation successful")
-            else:
-                logger.info("No cost change detected after BOM computation")
-
-        except Exception as e:
-            # This exception is expected - the method completes successfully despite raising it
-            logger.info(f"BOM cost computation completed for Product Template ID {product_tmpl_id}")
-
-        # Update existing sale order with new product
-        logger.info("Updating sale order with new product")
-        models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-            'sale.order', 'write',
-            [sale_order_id, {
-                'order_line': [(1, sale_order[0]['order_line'][0], {
-                    'product_id': product_id,
-                    'product_uom_qty': 1,
-                    'price_unit': price
-                })]
-            }])
-        logger.info("Sale order updated successfully")
-
-        # Trigger price update based on pricelist
+        # Trigger price update based on pricelist (once for entire order)
         logger.info("Triggering price update based on pricelist")
         # Note: This method raises an exception as expected behavior
         try:
@@ -983,17 +1023,21 @@ def handle_odoo_order():
             # This exception is expected - the method completes successfully despite raising it
             logger.info(f"Price update completed for Sale Order ID {sale_order_id}")
 
-        logger.info("Odoo order processing completed successfully")
-        logger.info(f"Results - Product ID: {product_id}, BOM ID: {bom_id}, Updated Order ID: {sale_order_id}")
+        # Calculate summary statistics
+        successful_lines = [line for line in processed_lines if line['status'] == 'success']
+        skipped_lines = [line for line in processed_lines if line['status'] == 'skipped']
 
-        # Generate timestamp for unique naming
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        logger.info("Odoo order processing completed successfully")
+        logger.info(f"Results - Processed {len(successful_lines)} lines, Skipped {len(skipped_lines)} lines, Updated Order ID: {sale_order_id}")
+
+        # Generate timestamp for attachments
+        final_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
         # Save original payload as attachment
         attachment_ids = []
         try:
             payload_json = json.dumps(data, indent=2, ensure_ascii=False)
-            attachment_name = f"odoo_order_payload_{timestamp}.json"
+            attachment_name = f"odoo_order_payload_{final_timestamp}.json"
 
             attachment_vals = {
                 'name': attachment_name,
@@ -1019,7 +1063,7 @@ def handle_odoo_order():
             logger.removeHandler(log_handler)
             log_capture_string.close()
 
-            log_attachment_name = f"odoo_order_processing_logs_{timestamp}.txt"
+            log_attachment_name = f"odoo_order_processing_logs_{final_timestamp}.txt"
 
             log_attachment_vals = {
                 'name': log_attachment_name,
@@ -1044,67 +1088,77 @@ def handle_odoo_order():
             except:
                 pass
 
-        # Create comprehensive HTML chatter message with all logs and final return
-        component_list_items = []
-        for i, component in enumerate(components, 1):
-            component_list_items.append(f"<li>Component {i}: {component['name']} (ref: {component['reference']})</li>")
+        # Build HTML sections for each processed line
+        processed_lines_html = []
+        for i, line in enumerate(processed_lines, 1):
+            if line['status'] == 'success':
+                component_list_items = []
+                for j, component in enumerate(line['components'], 1):
+                    component_list_items.append(f"<li>Component {j}: {component['name']} (ref: {component['reference']})</li>")
+
+                line_html = f"""
+<p><strong>📦 Line {i}: {line['original_product']}</strong></p>
+<ul>
+<li>Original: {line['original_product']} ({line['original_product_code']})</li>
+<li>New Product: {line['new_product_name']} (ref: {line['new_product_reference']})</li>
+<li>New Product ID: {line['new_product_id']}</li>
+<li>New BOM ID: {line['bom_id']}</li>
+<li>Dimensions: {line['width']}mm x {line['height']}mm</li>
+<li>Price: €{line['price']}</li>
+<li>Surface: {line['width'] * line['height']} mm² ({(line['width'] * line['height'])/1000000:.4f} m²)</li>
+<li>Circumference: {2 * (line['width'] + line['height'])} mm ({2 * (line['width'] + line['height'])/1000:.2f} m)</li>
+<li>BOM components: {line['bom_components_count']}, Operations: {line['bom_operations_count']}</li>
+<li>Initial cost: €{line['initial_cost']}, New cost: €{line['new_cost']}</li>
+</ul>
+<p><em>Components:</em></p>
+<ul>{''.join(component_list_items)}</ul>
+"""
+                processed_lines_html.append(line_html)
+            else:
+                line_html = f"""
+<p><strong>⚠️ Line {i}: {line['original_product']}</strong></p>
+<ul>
+<li>Status: Skipped</li>
+<li>Reason: {line['reason']}</li>
+</ul>
+"""
+                processed_lines_html.append(line_html)
+
+        # Build summary of product IDs and BOM IDs
+        product_ids = [line['new_product_id'] for line in successful_lines]
+        bom_ids_list = [line['bom_id'] for line in successful_lines]
 
         chatter_message = f"""<p><strong>🔄 Odoo Order Processing Completed Successfully</strong></p>
 
-<p><em>📎 Attachments: odoo_order_payload_{timestamp}.json, odoo_order_processing_logs_{timestamp}.txt</em></p>
+<p><em>📎 Attachments: odoo_order_payload_{final_timestamp}.json, odoo_order_processing_logs_{final_timestamp}.txt</em></p>
 
 <p><strong>📋 Order Summary:</strong></p>
 <ul>
 <li>Original Order ID: {sale_order_id}</li>
-<li>New Product ID: {product_id}</li>
-<li>New BOM ID: {bom_id}</li>
+<li>Total Order Lines: {len(order_line_ids)}</li>
+<li>Successfully Processed: {len(successful_lines)}</li>
+<li>Skipped: {len(skipped_lines)}</li>
+<li>New Product IDs: {product_ids}</li>
+<li>New BOM IDs: {bom_ids_list}</li>
 <li>Status: success</li>
 </ul>
 
-<p><strong>📝 Processing Details:</strong></p>
-
-<p><strong>Order Analysis:</strong></p>
-<ul>
-<li>Read existing sale order details</li>
-<li>Extracted product specs: {width}mm x {height}mm, €{price}</li>
-<li>Original product: {product_info[0]['name']} ({product_info[0]['default_code']})</li>
-<li>Found BOM ID: {bom_ids[0]}</li>
-</ul>
-
-<p><strong>Component Copying:</strong></p>
-<ul>
-<li>Copied {len(components)} components from existing BOM</li>
-</ul>
-
-<p><strong>Product Creation:</strong></p>
-<ul>
-<li>New product: {product_name} (ref: {product_reference})</li>
-<li>Dimensions: {width}mm x {height}mm</li>
-<li>Price: €{price}</li>
-<li>Surface: {width * height} mm² ({(width * height)/1000000:.4f} m²)</li>
-<li>Circumference: {2 * (width + height)} mm ({2 * (width + height)/1000:.2f} m)</li>
-</ul>
-
-<p><strong>Components Processed:</strong></p>
-<ul>{''.join(component_list_items)}</ul>
-
-<p><strong>BOM Cost Computation:</strong></p>
-<ul>
-<li>Initial cost: €{initial_cost if 'initial_cost' in locals() else 'N/A'}</li>
-<li>Cost after computation: €{new_cost if 'new_cost' in locals() else 'N/A'}</li>
-</ul>
+<p><strong>📝 Processing Details by Line:</strong></p>
+{''.join(processed_lines_html)}
 
 <p><strong>Order Update:</strong></p>
 <ul>
-<li>Updated sale order with new product</li>
+<li>Updated all order lines with new products</li>
 <li>Triggered price update based on pricelist</li>
 </ul>
 
 <p><strong>Final Return Data:</strong></p>
 <ul>
 <li>message: 'Odoo order processing finished'</li>
-<li>product_id: {product_id}</li>
-<li>bom_id: {bom_id}</li>
+<li>processed_lines: {len(successful_lines)}</li>
+<li>skipped_lines: {len(skipped_lines)}</li>
+<li>product_ids: {product_ids}</li>
+<li>bom_ids: {bom_ids_list}</li>
 <li>updated_order_id: {sale_order_id}</li>
 <li>status: 'success'</li>
 </ul>"""
@@ -1128,8 +1182,10 @@ def handle_odoo_order():
         # Prepare response data
         response_data = {
             'message': 'Odoo order processing finished',
-            'product_id': product_id,
-            'bom_id': bom_id,
+            'processed_lines': len(successful_lines),
+            'skipped_lines': len(skipped_lines),
+            'product_ids': product_ids,
+            'bom_ids': bom_ids_list,
             'updated_order_id': sale_order_id,
             'status': 'success'
         }
