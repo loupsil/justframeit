@@ -7,6 +7,7 @@ from io import StringIO
 from dotenv import load_dotenv
 import logging
 from datetime import datetime
+import requests
 from utils import log_route_call
 
 # Configure logging
@@ -62,6 +63,30 @@ def get_uid():
     except Exception as e:
         logger.error(f"Failed to authenticate with Odoo: {str(e)}")
         raise
+
+def download_image_as_base64(image_url):
+    """
+    Download an image from URL and return it as base64 encoded string.
+    
+    Args:
+        image_url: URL of the image to download
+        
+    Returns:
+        str: Base64 encoded image data, or None if download fails
+    """
+    try:
+        logger.info(f"Downloading image from: {image_url}")
+        response = requests.get(image_url, timeout=30)
+        response.raise_for_status()
+        
+        # Convert image content to base64
+        image_base64 = base64.b64encode(response.content).decode('ascii')
+        logger.info(f"Successfully downloaded and encoded image ({len(response.content)} bytes)")
+        return image_base64
+    except Exception as e:
+        logger.error(f"Failed to download image from {image_url}: {str(e)}")
+        return None
+
 
 def get_or_create_customer(models, uid, customer_data):
     """
@@ -361,6 +386,11 @@ def interpret_craft_payload(craft_payload):
             logger.error("No line items found in the order")
             raise ValueError("No line items found in the order")
 
+        # Extract discounts from adjustments (one discount per line item, in order)
+        adjustments = craft_payload.get('adjustments', [])
+        discount_adjustments = [adj for adj in adjustments if adj.get('type') == 'discount']
+        logger.info(f"Found {len(discount_adjustments)} discount adjustments")
+
         # Helper function to extract product code (part before dot)
         def extract_product_code(sku):
             if sku and '.' in sku:
@@ -444,13 +474,44 @@ def interpret_craft_payload(craft_payload):
             # Get description for product name
             description = line_item.get('description', f'Product {item_index + 1}')
 
+            # Get discount percentage for this line item (if available)
+            discount_percent = 0
+            if item_index < len(discount_adjustments):
+                discount_adj = discount_adjustments[item_index]
+                # Try to get percentage from sourceSnapshot, fallback to calculating from amount
+                source_snapshot = discount_adj.get('sourceSnapshot', {})
+                if source_snapshot.get('percentage'):
+                    discount_percent = source_snapshot['percentage']
+                    logger.info(f"Line item {item_index + 1}: Discount {discount_percent}% from sourceSnapshot")
+                elif discount_adj.get('amount'):
+                    # Calculate percentage from amount if not in sourceSnapshot
+                    # Amount is negative, and subtotal = price * qty
+                    subtotal = price * qty
+                    if subtotal > 0:
+                        discount_percent = abs(discount_adj['amount']) / subtotal * 100
+                        logger.info(f"Line item {item_index + 1}: Calculated discount {discount_percent:.2f}% from amount")
+                
+                discount_name = discount_adj.get('name', 'Discount')
+                discount_description = discount_adj.get('description', '')
+                logger.info(f"Line item {item_index + 1}: {discount_name} - {discount_description}")
+
+            # Extract photo information if available
+            photo_info = options.get('photo')
+            photo_url = None
+            if photo_info and isinstance(photo_info, dict):
+                photo_url = photo_info.get('path')
+                if photo_url:
+                    logger.info(f"Found photo URL for line item {item_index + 1}: {photo_url}")
+
             product = {
                 'width': width,
                 'height': height,
                 'price': price,
                 'qty': qty,
+                'discount': discount_percent,
                 'components': components,
-                'description': description
+                'description': description,
+                'photo_url': photo_url
             }
             products.append(product)
 
@@ -623,15 +684,120 @@ def handle_web_order():
                 product_data['price'], product_data['components']
             )
             
+            # Attach image to product if photo URL is available
+            photo_url = product_data.get('photo_url')
+            image_base64 = None
+            image_attachment_id = None
+            if photo_url:
+                logger.info(f"Downloading image for product {product_id}")
+                image_base64 = download_image_as_base64(photo_url)
+                if image_base64:
+                    # Get the product template ID
+                    product_data_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                        'product.product', 'read', [product_id], {'fields': ['product_tmpl_id']})
+                    product_tmpl_id = product_data_info[0]['product_tmpl_id'][0]
+                    logger.info(f"Product template ID: {product_tmpl_id}")
+                    
+                    # Set as product variant main image (product.product)
+                    try:
+                        models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                            'product.product', 'write',
+                            [[product_id], {'image_1920': image_base64}])
+                        logger.info(f"Successfully set main image for product.product {product_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to set main image for product.product {product_id}: {str(e)}")
+                    
+                    # Set as product template main image (product.template)
+                    try:
+                        models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                            'product.template', 'write',
+                            [[product_tmpl_id], {'image_1920': image_base64}])
+                        logger.info(f"Successfully set main image for product.template {product_tmpl_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to set main image for product.template {product_tmpl_id}: {str(e)}")
+                    
+                    # Extract filename from URL or generate one
+                    image_filename = photo_url.split('/')[-1] if '/' in photo_url else f"product_image_{product_index + 1}.jpg"
+                    
+                    # Create attachment for product variant (product.product) chatter
+                    try:
+                        product_attachment_vals = {
+                            'name': image_filename,
+                            'type': 'binary',
+                            'datas': image_base64,
+                            'res_model': 'product.product',
+                            'res_id': product_id,
+                            'mimetype': 'image/jpeg'
+                        }
+                        
+                        image_attachment_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                            'ir.attachment', 'create', [product_attachment_vals])
+                        logger.info(f"Created image attachment for product.product {product_id}: {image_filename} (ID: {image_attachment_id})")
+                        
+                        # Post message with image to product variant chatter
+                        models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                            'product.product', 'message_post',
+                            [product_id],
+                            {
+                                'body': f'<p>📷 Product image attached from order</p>',
+                                'body_is_html': True,
+                                'message_type': 'comment',
+                                'subtype_xmlid': 'mail.mt_note',
+                                'attachment_ids': [image_attachment_id],
+                            })
+                        logger.info(f"Posted image to product.product {product_id} chatter")
+                    except Exception as e:
+                        logger.error(f"Failed to create image attachment for product.product {product_id}: {str(e)}")
+                    
+                    # Create attachment for product template (product.template) chatter
+                    try:
+                        template_attachment_vals = {
+                            'name': image_filename,
+                            'type': 'binary',
+                            'datas': image_base64,
+                            'res_model': 'product.template',
+                            'res_id': product_tmpl_id,
+                            'mimetype': 'image/jpeg'
+                        }
+                        
+                        template_attachment_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                            'ir.attachment', 'create', [template_attachment_vals])
+                        logger.info(f"Created image attachment for product.template {product_tmpl_id}: {image_filename} (ID: {template_attachment_id})")
+                        
+                        # Post message with image to product template chatter
+                        models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                            'product.template', 'message_post',
+                            [product_tmpl_id],
+                            {
+                                'body': f'<p>📷 Product image attached from order</p>',
+                                'body_is_html': True,
+                                'message_type': 'comment',
+                                'subtype_xmlid': 'mail.mt_note',
+                                'attachment_ids': [template_attachment_id],
+                            })
+                        logger.info(f"Posted image to product.template {product_tmpl_id} chatter")
+                    except Exception as e:
+                        logger.error(f"Failed to create image attachment for product.template {product_tmpl_id}: {str(e)}")
+            
             # Get quantity (default to 1 if not specified)
             qty = product_data.get('qty', 1)
             
-            # Add order line with correct quantity
-            order_lines.append((0, 0, {
+            # Get discount percentage (default to 0 if not specified)
+            discount = product_data.get('discount', 0)
+            
+            # Add order line with correct quantity and discount
+            order_line_vals = {
                 'product_id': product_id,
                 'product_uom_qty': qty,
                 'price_unit': product_data['price']
-            }))
+            }
+            
+            # Only add discount if it's greater than 0
+            if discount > 0:
+                order_line_vals['discount'] = discount
+                logger.info(f"Applying {discount}% discount to order line")
+            
+            order_lines.append((0, 0, order_line_vals))
             
             # Track created product info for logging
             created_products.append({
@@ -645,10 +811,14 @@ def handle_web_order():
                 'height': product_data['height'],
                 'price': product_data['price'],
                 'qty': qty,
-                'components': product_data['components']
+                'discount': discount,
+                'components': product_data['components'],
+                'photo_url': photo_url,
+                'image_base64': image_base64,
+                'image_attachment_id': image_attachment_id
             })
             
-            logger.info(f"Product {product_index + 1} created: ID={product_id}, BOM ID={bom_id}, Qty={qty}")
+            logger.info(f"Product {product_index + 1} created: ID={product_id}, BOM ID={bom_id}, Qty={qty}, Discount={discount}%")
 
         # Create sale order with all order lines
         logger.info("Creating sale order with all order lines")
@@ -663,6 +833,48 @@ def handle_web_order():
 
         logger.info("Web order processing completed successfully")
         logger.info(f"Results - Customer ID: {partner_id}, Products: {len(created_products)}, Order ID: {order_id}")
+
+        # Attach product images to sale order chatter
+        sale_order_image_attachment_ids = []
+        for prod_idx, prod in enumerate(created_products):
+            if prod.get('image_base64'):
+                try:
+                    # Extract filename from URL or generate one
+                    image_filename = prod['photo_url'].split('/')[-1] if prod.get('photo_url') and '/' in prod['photo_url'] else f"product_{prod_idx + 1}_image.jpg"
+                    
+                    # Create attachment linked to the sale order
+                    sale_order_image_vals = {
+                        'name': image_filename,
+                        'type': 'binary',
+                        'datas': prod['image_base64'],
+                        'res_model': 'sale.order',
+                        'res_id': order_id,
+                        'mimetype': 'image/jpeg'
+                    }
+                    
+                    sale_order_image_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                        'ir.attachment', 'create', [sale_order_image_vals])
+                    sale_order_image_attachment_ids.append(sale_order_image_id)
+                    logger.info(f"Created image attachment for sale order {order_id}: {image_filename} (ID: {sale_order_image_id})")
+                except Exception as e:
+                    logger.error(f"Failed to create image attachment for sale order: {str(e)}")
+        
+        # Post images to sale order chatter if any
+        if sale_order_image_attachment_ids:
+            try:
+                models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                    'sale.order', 'message_post',
+                    [order_id],
+                    {
+                        'body': f'<p>📷 {len(sale_order_image_attachment_ids)} product image(s) attached</p>',
+                        'body_is_html': True,
+                        'message_type': 'comment',
+                        'subtype_xmlid': 'mail.mt_note',
+                        'attachment_ids': sale_order_image_attachment_ids,
+                    })
+                logger.info(f"Posted {len(sale_order_image_attachment_ids)} image(s) to sale order {order_id} chatter")
+            except Exception as e:
+                logger.error(f"Failed to post images to sale order chatter: {str(e)}")
 
         # Save original payload as attachment
         attachment_ids = []
@@ -727,6 +939,12 @@ def handle_web_order():
             for i, component in enumerate(prod['components'], 1):
                 component_list_items.append(f"<li>Component {i}: {component['name']} (ref: {component['reference']})</li>")
             
+            # Show discount if applicable
+            discount_html = f"<li>Discount: {prod['discount']}%</li>" if prod.get('discount', 0) > 0 else ""
+            
+            # Show photo if available
+            photo_html = f"<li>Photo: <a href='{prod['photo_url']}' target='_blank'>View Image</a></li>" if prod.get('photo_url') else ""
+            
             products_html.append(f"""
 <p><strong>Product {idx}: {prod['product_name']}</strong></p>
 <ul>
@@ -735,6 +953,8 @@ def handle_web_order():
 <li>Dimensions: {prod['width']}mm x {prod['height']}mm</li>
 <li>Unit Price: €{prod['price']}</li>
 <li>Quantity: {prod['qty']}</li>
+{discount_html}
+{photo_html}
 <li>Surface: {prod['width'] * prod['height']} mm² ({(prod['width'] * prod['height'])/1000000:.4f} m²)</li>
 <li>Circumference: {2 * (prod['width'] + prod['height'])} mm ({2 * (prod['width'] + prod['height'])/1000:.2f} m)</li>
 <li>BOM components: {prod['bom_components_count']} items</li>
