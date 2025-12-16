@@ -1128,7 +1128,7 @@ def handle_odoo_order():
             order_line = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
                 'sale.order.line', 'read',
                 [order_line_id],
-                {'fields': ['product_id', 'price_unit']})
+                {'fields': ['product_id', 'price_unit', 'product_uom_qty']})
 
             product_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
                 'product.product', 'read',
@@ -1139,10 +1139,11 @@ def handle_odoo_order():
             width = product_info[0]['x_studio_width']
             height = product_info[0]['x_studio_height']
             price = order_line[0]['price_unit']
+            quantity = order_line[0]['product_uom_qty']
             original_product_name = product_info[0]['name']
             original_product_code = product_info[0]['default_code']
 
-            logger.info(f"Extracted product specs: {width}mm x {height}mm, €{price}")
+            logger.info(f"Extracted product specs: {width}mm x {height}mm, €{price}, qty: {quantity}")
             logger.info(f"Original product: {original_product_name} ({original_product_code})")
 
             # Get BOM for the existing product
@@ -1263,11 +1264,11 @@ def handle_odoo_order():
                 [sale_order_id, {
                     'order_line': [(1, order_line_id, {
                         'product_id': product_id,
-                        'product_uom_qty': 1,
+                        'product_uom_qty': quantity,
                         'price_unit': price
                     })]
                 }])
-            logger.info(f"Order line {order_line_id} updated successfully")
+            logger.info(f"Order line {order_line_id} updated successfully with quantity: {quantity}")
 
             # Track processed line results
             processed_lines.append({
@@ -1281,6 +1282,7 @@ def handle_odoo_order():
                 'width': width,
                 'height': height,
                 'price': price,
+                'quantity': quantity,
                 'components': components,
                 'bom_components_count': bom_components_count,
                 'bom_operations_count': bom_operations_count,
@@ -1386,6 +1388,7 @@ def handle_odoo_order():
 <li>New Product ID: {line['new_product_id']}</li>
 <li>New BOM ID: {line['bom_id']}</li>
 <li>Dimensions: {line['width']}mm x {line['height']}mm</li>
+<li>Quantity: {line['quantity']}</li>
 <li>Price: €{line['price']}</li>
 <li>Surface: {line['width'] * line['height']} mm² ({(line['width'] * line['height'])/1000000:.4f} m²)</li>
 <li>Circumference: {2 * (line['width'] + line['height'])} mm ({2 * (line['width'] + line['height'])/1000:.2f} m)</li>
