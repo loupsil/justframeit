@@ -165,7 +165,8 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
         components: List of component dictionaries with 'name' and 'reference' keys
 
     Returns:
-        tuple: (product_id, bom_id, bom_components_count, bom_operations_count)
+        tuple: (product_id, bom_id, bom_components_count, bom_operations_count, skipped_components)
+               skipped_components is a list of dicts with 'name', 'reference', 'reason' for components not found
     """
     logger.info("Starting product and BOM creation process")
     logger.info(f"Product: {product_name} (ref: {product_reference})")
@@ -205,6 +206,8 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
     logger.debug(f"Converted dimensions - Surface: {surface_m2} m², Circumference: {circumference_m} m")
 
     logger.info("Processing components for BOM")
+    skipped_components = []  # Track skipped components for logging
+    
     for i, component in enumerate(components, 1):
         logger.info(f"Processing component {i}/{len(components)}: {component['name']} (ref: {component['reference']})")
 
@@ -215,8 +218,15 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
             [[['x_studio_product_code', '=', component['reference']]]])
 
         if not component_ids:
-            logger.error(f"Component with reference '{component['reference']}' not found in Odoo")
-            raise ValueError(f"Component with reference '{component['reference']}' not found in Odoo")
+            # Log warning and skip this component instead of crashing
+            skip_message = f"Component '{component['name']}' with reference '{component['reference']}' not found in Odoo - SKIPPED"
+            logger.warning(skip_message)
+            skipped_components.append({
+                'name': component['name'],
+                'reference': component['reference'],
+                'reason': 'Not found in Odoo'
+            })
+            continue  # Skip to next component
 
         component_id = component_ids[0]
         logger.info(f"Found component ID: {component_id}")
@@ -293,6 +303,14 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
             }))
             logger.info("Added operation to BOM")
 
+    # Log summary of skipped components
+    if skipped_components:
+        logger.warning(f"⚠️ {len(skipped_components)} component(s) were SKIPPED (not found in Odoo):")
+        for skipped in skipped_components:
+            logger.warning(f"  - {skipped['name']} (ref: {skipped['reference']}): {skipped['reason']}")
+    else:
+        logger.info("All components were found and added to BOM")
+
     # Get the product template ID from the created product
     logger.info("Getting product template ID")
     product_data = models.execute_kw(
@@ -331,7 +349,7 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
     logger.info(f"BOM created with ID: {bom_id}")
     logger.info("Product and BOM creation completed successfully")
 
-    return product_id, bom_id, len(bom_components), len(bom_operations)
+    return product_id, bom_id, len(bom_components), len(bom_operations), skipped_components
 
 def interpret_craft_payload(craft_payload):
     """
@@ -425,49 +443,46 @@ def interpret_craft_payload(craft_payload):
 
             logger.info(f"Line item {item_index + 1}: {width}mm x {height}mm, Unit Price: €{price}, Qty: {qty}")
 
-            # Extract components from SKUs
-            logger.info(f"Extracting components from SKUs for line item {item_index + 1}")
+            # Extract components from priceBreakdown (contains all products with SKUs)
+            logger.info(f"Extracting components from priceBreakdown for line item {item_index + 1}")
             components = []
+            price_breakdown = options.get('priceBreakdown', {})
 
-            # Add list/frame component
-            list_sku = configuration.get('listSku')
-            if list_sku:
-                processed_sku = extract_product_code(list_sku)
-                components.append({
-                    'name': 'Frame',
-                    'reference': processed_sku
-                })
-                logger.info(f"Added Frame component: {processed_sku}")
+            # Define product type mappings for readable names
+            product_type_names = {
+                'list': 'Frame',
+                'glass': 'Glass',
+                'passePartout': 'Passe-Partout',
+                'backCover': 'Back Cover',
+                'printOption': 'Print Option',
+                'glueOption': 'Glue Option',
+                'glueSurface': 'Glue Surface',
+                'AK.DIENST': 'Assembling Frame',
+                'BF.X': 'Packaging Material',
+                'IN.DIENST': 'Framing'
+            }
 
-            # Add glass component
-            glass_sku = configuration.get('glassSku')
-            if glass_sku:
-                processed_sku = extract_product_code(glass_sku)
-                components.append({
-                    'name': 'Glass',
-                    'reference': processed_sku
-                })
-                logger.info(f"Added Glass component: {processed_sku}")
+            # Process all items in priceBreakdown
+            for product_type, breakdown_data in price_breakdown.items():
+                if not isinstance(breakdown_data, dict):
+                    continue
+                    
+                products_list = breakdown_data.get('products', [])
+                if not products_list:
+                    logger.debug(f"No products found in priceBreakdown for '{product_type}'")
+                    continue
 
-            # Add passe-partout components (can be multiple)
-            passe_partout_skus = configuration.get('passePartoutSku', [])
-            if isinstance(passe_partout_skus, list):
-                logger.debug(f"Found {len(passe_partout_skus)} passe-partout SKUs")
-                for sku in passe_partout_skus:
+                for product_item in products_list:
+                    sku = product_item.get('sku')
                     if sku:
                         processed_sku = extract_product_code(sku)
+                        # Get readable name or use the product field from breakdown, fallback to product_type
+                        readable_name = product_type_names.get(product_type, product_item.get('product', product_type))
                         components.append({
-                            'name': 'Passe-Partout',
+                            'name': readable_name,
                             'reference': processed_sku
                         })
-                        logger.info(f"Added Passe-Partout component: {processed_sku}")
-            elif passe_partout_skus:  # Single SKU
-                processed_sku = extract_product_code(passe_partout_skus)
-                components.append({
-                    'name': 'Passe-Partout',
-                    'reference': processed_sku
-                })
-                logger.info(f"Added Passe-Partout component: {processed_sku}")
+                        logger.info(f"Added {readable_name} component: {processed_sku} (from priceBreakdown.{product_type})")
 
             logger.info(f"Total components extracted for line item {item_index + 1}: {len(components)}")
 
@@ -677,12 +692,16 @@ def handle_web_order():
 
             # Use shared function to create product and BOM
             logger.info(f"Creating product and BOM for product {product_index + 1}")
-            product_id, bom_id, bom_components_count, bom_operations_count = create_product_and_bom(
+            product_id, bom_id, bom_components_count, bom_operations_count, skipped_components = create_product_and_bom(
                 models, uid,
                 product_name, product_reference,
                 product_data['width'], product_data['height'],
                 product_data['price'], product_data['components']
             )
+            
+            # Log skipped components if any
+            if skipped_components:
+                logger.warning(f"Product {product_index + 1}: {len(skipped_components)} component(s) were skipped")
             
             # Attach image to product if photo URL is available
             photo_url = product_data.get('photo_url')
@@ -807,6 +826,7 @@ def handle_web_order():
                 'bom_id': bom_id,
                 'bom_components_count': bom_components_count,
                 'bom_operations_count': bom_operations_count,
+                'skipped_components': skipped_components,
                 'width': product_data['width'],
                 'height': product_data['height'],
                 'price': product_data['price'],
@@ -945,6 +965,17 @@ def handle_web_order():
             # Show photo if available
             photo_html = f"<li>Photo: <a href='{prod['photo_url']}' target='_blank'>View Image</a></li>" if prod.get('photo_url') else ""
             
+            # Show skipped components if any
+            skipped_html = ""
+            if prod.get('skipped_components'):
+                skipped_items = []
+                for skipped in prod['skipped_components']:
+                    skipped_items.append(f"<li>⚠️ {skipped['name']} (ref: {skipped['reference']}) - {skipped['reason']}</li>")
+                skipped_html = f"""
+<p><em>⚠️ Skipped Components ({len(prod['skipped_components'])}):</em></p>
+<ul>{''.join(skipped_items)}</ul>
+"""
+            
             products_html.append(f"""
 <p><strong>Product {idx}: {prod['product_name']}</strong></p>
 <ul>
@@ -962,7 +993,7 @@ def handle_web_order():
 </ul>
 <p><em>Components:</em></p>
 <ul>{''.join(component_list_items)}</ul>
-""")
+{skipped_html}""")
 
         chatter_message = f"""<p><strong>🎯 {payload_type} Order Processing Completed Successfully</strong></p>
 
@@ -1202,11 +1233,15 @@ def handle_odoo_order():
 
             # Use shared function to create product and BOM
             logger.info("Creating new product and BOM")
-            product_id, bom_id, bom_components_count, bom_operations_count = create_product_and_bom(
+            product_id, bom_id, bom_components_count, bom_operations_count, skipped_components = create_product_and_bom(
                 models, uid,
                 product_name, product_reference,
                 width, height, price, components
             )
+            
+            # Log skipped components if any
+            if skipped_components:
+                logger.warning(f"Order line {line_index + 1}: {len(skipped_components)} component(s) were skipped")
 
             # Compute BOM cost for the newly created product
             logger.info("Computing BOM cost for new product")
@@ -1284,6 +1319,7 @@ def handle_odoo_order():
                 'price': price,
                 'quantity': quantity,
                 'components': components,
+                'skipped_components': skipped_components,
                 'bom_components_count': bom_components_count,
                 'bom_operations_count': bom_operations_count,
                 'initial_cost': initial_cost,
@@ -1380,6 +1416,17 @@ def handle_odoo_order():
                 for j, component in enumerate(line['components'], 1):
                     component_list_items.append(f"<li>Component {j}: {component['name']} (ref: {component['reference']})</li>")
 
+                # Show skipped components if any
+                skipped_html = ""
+                if line.get('skipped_components'):
+                    skipped_items = []
+                    for skipped in line['skipped_components']:
+                        skipped_items.append(f"<li>⚠️ {skipped['name']} (ref: {skipped['reference']}) - {skipped['reason']}</li>")
+                    skipped_html = f"""
+<p><em>⚠️ Skipped Components ({len(line['skipped_components'])}):</em></p>
+<ul>{''.join(skipped_items)}</ul>
+"""
+
                 line_html = f"""
 <p><strong>📦 Line {i}: {line['original_product']}</strong></p>
 <ul>
@@ -1397,7 +1444,7 @@ def handle_odoo_order():
 </ul>
 <p><em>Components:</em></p>
 <ul>{''.join(component_list_items)}</ul>
-"""
+{skipped_html}"""
                 processed_lines_html.append(line_html)
             else:
                 line_html = f"""
