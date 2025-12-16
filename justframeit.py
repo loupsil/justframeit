@@ -316,7 +316,7 @@ def interpret_craft_payload(craft_payload):
         craft_payload (dict): The complex payload from Craft CMS
 
     Returns:
-        dict: Simplified payload with customer and product information
+        dict: Simplified payload with customer and products (list) information
     """
     try:
         logger.info("Starting Craft CMS payload interpretation")
@@ -352,36 +352,14 @@ def interpret_craft_payload(craft_payload):
         }
         logger.info(f"Customer extracted: {customer['name']} ({customer['email']})")
 
-        # Extract product information from first line item
-        logger.info("Extracting product information")
+        # Extract product information from ALL line items
+        logger.info("Extracting product information from all line items")
         line_items = craft_payload.get('lineItems', [])
         logger.debug(f"Found {len(line_items)} line items")
 
         if not line_items:
             logger.error("No line items found in the order")
             raise ValueError("No line items found in the order")
-
-        line_item = line_items[0]  # Assume first item is the main product
-        logger.info("Processing first line item as main product")
-        options = line_item.get('options', {})
-        configuration = options.get('configuration', {})
-
-        logger.debug(f"Configuration keys: {list(configuration.keys()) if configuration else 'None'}")
-
-        # Extract dimensions (convert from cm to mm)
-        width_cm = configuration.get('width', 0)
-        height_cm = configuration.get('height', 0)
-        price = line_item.get('total', 0)
-
-        # Convert cm to mm
-        width = width_cm * 10
-        height = height_cm * 10
-
-        logger.info(f"Dimensions: {width}mm x {height}mm (converted from {width_cm}cm x {height_cm}cm), Price: €{price}")
-
-        # Extract components from SKUs
-        logger.info("Extracting components from SKUs")
-        components = []
 
         # Helper function to extract product code (part before dot)
         def extract_product_code(sku):
@@ -392,64 +370,100 @@ def interpret_craft_payload(craft_payload):
                 return extracted
             return sku
 
-        # Add list/frame component
-        list_sku = configuration.get('listSku')
-        if list_sku:
-            processed_sku = extract_product_code(list_sku)
-            components.append({
-                'name': 'Frame',
-                'reference': processed_sku
-            })
-            logger.info(f"Added Frame component: {processed_sku}")
+        # Process ALL line items
+        products = []
+        for item_index, line_item in enumerate(line_items):
+            logger.info(f"Processing line item {item_index + 1}/{len(line_items)}")
+            options = line_item.get('options', {})
+            configuration = options.get('configuration', {})
 
-        # Add glass component
-        glass_sku = configuration.get('glassSku')
-        if glass_sku:
-            processed_sku = extract_product_code(glass_sku)
-            components.append({
-                'name': 'Glass',
-                'reference': processed_sku
-            })
-            logger.info(f"Added Glass component: {processed_sku}")
+            logger.debug(f"Configuration keys: {list(configuration.keys()) if configuration else 'None'}")
 
-        # Add passe-partout components (can be multiple)
-        passe_partout_skus = configuration.get('passePartoutSku', [])
-        if isinstance(passe_partout_skus, list):
-            logger.debug(f"Found {len(passe_partout_skus)} passe-partout SKUs")
-            for sku in passe_partout_skus:
-                if sku:
-                    processed_sku = extract_product_code(sku)
-                    components.append({
-                        'name': 'Passe-Partout',
-                        'reference': processed_sku
-                    })
-                    logger.info(f"Added Passe-Partout component: {processed_sku}")
-        elif passe_partout_skus:  # Single SKU
-            processed_sku = extract_product_code(passe_partout_skus)
-            components.append({
-                'name': 'Passe-Partout',
-                'reference': processed_sku
-            })
-            logger.info(f"Added Passe-Partout component: {processed_sku}")
+            # Extract dimensions (convert from cm to mm)
+            width_cm = configuration.get('width', 0)
+            height_cm = configuration.get('height', 0)
+            
+            # Use unit price (excl. VAT) instead of total (incl. VAT) to avoid double VAT
+            price = line_item.get('price', 0)
+            
+            # Extract quantity
+            qty = line_item.get('qty', 1)
 
-        logger.info(f"Total components extracted: {len(components)}")
+            # Convert cm to mm
+            width = width_cm * 10
+            height = height_cm * 10
 
+            logger.info(f"Line item {item_index + 1}: {width}mm x {height}mm, Unit Price: €{price}, Qty: {qty}")
 
-        product = {
-            'width': width,
-            'height': height,
-            'price': price,
-            'components': components
-        }
+            # Extract components from SKUs
+            logger.info(f"Extracting components from SKUs for line item {item_index + 1}")
+            components = []
+
+            # Add list/frame component
+            list_sku = configuration.get('listSku')
+            if list_sku:
+                processed_sku = extract_product_code(list_sku)
+                components.append({
+                    'name': 'Frame',
+                    'reference': processed_sku
+                })
+                logger.info(f"Added Frame component: {processed_sku}")
+
+            # Add glass component
+            glass_sku = configuration.get('glassSku')
+            if glass_sku:
+                processed_sku = extract_product_code(glass_sku)
+                components.append({
+                    'name': 'Glass',
+                    'reference': processed_sku
+                })
+                logger.info(f"Added Glass component: {processed_sku}")
+
+            # Add passe-partout components (can be multiple)
+            passe_partout_skus = configuration.get('passePartoutSku', [])
+            if isinstance(passe_partout_skus, list):
+                logger.debug(f"Found {len(passe_partout_skus)} passe-partout SKUs")
+                for sku in passe_partout_skus:
+                    if sku:
+                        processed_sku = extract_product_code(sku)
+                        components.append({
+                            'name': 'Passe-Partout',
+                            'reference': processed_sku
+                        })
+                        logger.info(f"Added Passe-Partout component: {processed_sku}")
+            elif passe_partout_skus:  # Single SKU
+                processed_sku = extract_product_code(passe_partout_skus)
+                components.append({
+                    'name': 'Passe-Partout',
+                    'reference': processed_sku
+                })
+                logger.info(f"Added Passe-Partout component: {processed_sku}")
+
+            logger.info(f"Total components extracted for line item {item_index + 1}: {len(components)}")
+
+            # Get description for product name
+            description = line_item.get('description', f'Product {item_index + 1}')
+
+            product = {
+                'width': width,
+                'height': height,
+                'price': price,
+                'qty': qty,
+                'components': components,
+                'description': description
+            }
+            products.append(product)
+
+        logger.info(f"Total products extracted: {len(products)}")
 
         logger.info("Creating simplified payload structure")
         payload = {
             'customer': customer,
-            'product': product
+            'products': products  # Changed from 'product' to 'products' (list)
         }
 
         logger.info("Craft CMS payload interpretation completed successfully")
-        logger.debug(f"Final payload structure: customer={bool(customer)}, product={bool(product)}")
+        logger.debug(f"Final payload structure: customer={bool(customer)}, products={len(products)}")
 
         # Return simplified payload
         return payload
@@ -542,9 +556,16 @@ def handle_web_order():
         else:
             # Assume it's already in simple format
             logger.info("Detected simple payload format")
-            if 'product' not in data or 'customer' not in data:
+            # Support both 'product' (single) and 'products' (list) formats
+            if 'products' not in data and 'product' not in data:
                 logger.error("Simple payload missing required fields")
-                return jsonify({'error': 'Missing product or customer data in request'}), 400
+                return jsonify({'error': 'Missing product(s) or customer data in request'}), 400
+            if 'customer' not in data:
+                logger.error("Simple payload missing customer field")
+                return jsonify({'error': 'Missing customer data in request'}), 400
+            # Convert single product format to products list for consistency
+            if 'product' in data and 'products' not in data:
+                data['products'] = [data['product']]
             payload = data
 
         # Log the payload type for debugging
@@ -554,20 +575,6 @@ def handle_web_order():
         # Generate timestamp for unique naming if needed
         logger.info("Generating timestamp for unique naming")
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-
-        # Auto-generate product name and reference with timestamp if not provided or placeholder
-        product_name = payload['product'].get('name', '').strip()
-        product_reference = payload['product'].get('reference', '').strip()
-
-        # If name is empty or contains placeholder, generate with timestamp
-        if not product_name or product_name.lower() in ['', 'auto', 'generate']:
-            product_name = f"Finished Product {timestamp}"
-            logger.info(f"Auto-generated product name: {product_name}")
-
-        # If reference is empty or contains placeholder, generate with timestamp
-        if not product_reference or product_reference.lower() in ['', 'auto', 'generate']:
-            product_reference = f"FINISHED_PRODUCT_{timestamp}"
-            logger.info(f"Auto-generated product reference: {product_reference}")
 
         # Get Odoo connection using existing helper functions
         logger.info("Connecting to Odoo")
@@ -579,32 +586,83 @@ def handle_web_order():
         logger.info("Processing customer information")
         partner_id, customer_action = get_or_create_customer(models, uid, payload['customer'])
 
-        # Use shared function to create product and BOM
-        logger.info("Creating product and BOM")
-        product_id, bom_id, bom_components_count, bom_operations_count = create_product_and_bom(
-            models, uid,
-            product_name, product_reference,
-            payload['product']['width'], payload['product']['height'],
-            payload['product']['price'], payload['product']['components']
-        )
+        # Process ALL products and create order lines
+        products = payload['products']
+        logger.info(f"Processing {len(products)} product(s)")
+        
+        order_lines = []
+        created_products = []  # Track all created products for logging
+        
+        for product_index, product_data in enumerate(products):
+            logger.info(f"--- Processing product {product_index + 1}/{len(products)} ---")
+            
+            # Auto-generate product name and reference with timestamp if not provided
+            product_name = product_data.get('name', '').strip() if product_data.get('name') else ''
+            product_reference = product_data.get('reference', '').strip() if product_data.get('reference') else ''
 
-        # Create sale order
-        logger.info("Creating sale order")
+            # Use description from line item if available for product name
+            if not product_name:
+                description = product_data.get('description', '')
+                if description:
+                    product_name = f"{description} {timestamp}_{product_index + 1}"
+                else:
+                    product_name = f"Finished Product {timestamp}_{product_index + 1}"
+                logger.info(f"Auto-generated product name: {product_name}")
+
+            # If reference is empty, generate with timestamp
+            if not product_reference:
+                product_reference = f"FINISHED_PRODUCT_{timestamp}_{product_index + 1}"
+                logger.info(f"Auto-generated product reference: {product_reference}")
+
+            # Use shared function to create product and BOM
+            logger.info(f"Creating product and BOM for product {product_index + 1}")
+            product_id, bom_id, bom_components_count, bom_operations_count = create_product_and_bom(
+                models, uid,
+                product_name, product_reference,
+                product_data['width'], product_data['height'],
+                product_data['price'], product_data['components']
+            )
+            
+            # Get quantity (default to 1 if not specified)
+            qty = product_data.get('qty', 1)
+            
+            # Add order line with correct quantity
+            order_lines.append((0, 0, {
+                'product_id': product_id,
+                'product_uom_qty': qty,
+                'price_unit': product_data['price']
+            }))
+            
+            # Track created product info for logging
+            created_products.append({
+                'product_id': product_id,
+                'product_name': product_name,
+                'product_reference': product_reference,
+                'bom_id': bom_id,
+                'bom_components_count': bom_components_count,
+                'bom_operations_count': bom_operations_count,
+                'width': product_data['width'],
+                'height': product_data['height'],
+                'price': product_data['price'],
+                'qty': qty,
+                'components': product_data['components']
+            })
+            
+            logger.info(f"Product {product_index + 1} created: ID={product_id}, BOM ID={bom_id}, Qty={qty}")
+
+        # Create sale order with all order lines
+        logger.info("Creating sale order with all order lines")
         order_vals = {
             'partner_id': partner_id,
-            'order_line': [(0, 0, {
-                'product_id': product_id,
-                'product_uom_qty': 1,
-                'price_unit': payload['product']['price']
-            })]
+            'order_line': order_lines
         }
 
-        logger.debug(f"Sale order values: partner_id={partner_id}, product_id={product_id}")
+        logger.debug(f"Sale order values: partner_id={partner_id}, {len(order_lines)} order line(s)")
         order_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
             'sale.order', 'create', [order_vals])
 
         logger.info("Web order processing completed successfully")
-        logger.info(f"Results - Customer ID: {partner_id}, Product ID: {product_id}, BOM ID: {bom_id}, Order ID: {order_id}")
+        logger.info(f"Results - Customer ID: {partner_id}, Products: {len(created_products)}, Order ID: {order_id}")
 
         # Save original payload as attachment
         attachment_ids = []
@@ -662,9 +720,29 @@ def handle_web_order():
                 pass
 
         # Create comprehensive HTML chatter message with all logs and final return
-        component_list_items = []
-        for i, component in enumerate(payload['product']['components'], 1):
-            component_list_items.append(f"<li>Component {i}: {component['name']} (ref: {component['reference']})</li>")
+        # Build product details HTML for all products
+        products_html = []
+        for idx, prod in enumerate(created_products, 1):
+            component_list_items = []
+            for i, component in enumerate(prod['components'], 1):
+                component_list_items.append(f"<li>Component {i}: {component['name']} (ref: {component['reference']})</li>")
+            
+            products_html.append(f"""
+<p><strong>Product {idx}: {prod['product_name']}</strong></p>
+<ul>
+<li>Product ID: {prod['product_id']} (ref: {prod['product_reference']})</li>
+<li>BOM ID: {prod['bom_id']}</li>
+<li>Dimensions: {prod['width']}mm x {prod['height']}mm</li>
+<li>Unit Price: €{prod['price']}</li>
+<li>Quantity: {prod['qty']}</li>
+<li>Surface: {prod['width'] * prod['height']} mm² ({(prod['width'] * prod['height'])/1000000:.4f} m²)</li>
+<li>Circumference: {2 * (prod['width'] + prod['height'])} mm ({2 * (prod['width'] + prod['height'])/1000:.2f} m)</li>
+<li>BOM components: {prod['bom_components_count']} items</li>
+<li>BOM operations: {prod['bom_operations_count']} items</li>
+</ul>
+<p><em>Components:</em></p>
+<ul>{''.join(component_list_items)}</ul>
+""")
 
         chatter_message = f"""<p><strong>🎯 {payload_type} Order Processing Completed Successfully</strong></p>
 
@@ -673,9 +751,9 @@ def handle_web_order():
 <p><strong>📋 Order Summary:</strong></p>
 <ul>
 <li>Customer ID: {partner_id}</li>
-<li>Product ID: {product_id}</li>
-<li>BOM ID: {bom_id}</li>
 <li>Order ID: {order_id}</li>
+<li>Products Created: {len(created_products)}</li>
+<li>Total Order Lines: {len(order_lines)}</li>
 <li>Payload Type: {payload_type}</li>
 <li>Status: success</li>
 </ul>
@@ -694,31 +772,14 @@ def handle_web_order():
 <li>{customer_action.title()} customer: {payload['customer']['name']} ({payload['customer']['email']})</li>
 </ul>
 
-<p><strong>Product Creation:</strong></p>
-<ul>
-<li>Product: {product_name} (ref: {product_reference})</li>
-<li>Dimensions: {payload['product']['width']}mm x {payload['product']['height']}mm</li>
-<li>Price: €{payload['product']['price']}</li>
-<li>Components: {len(payload['product']['components'])} items</li>
-</ul>
-
-<p><strong>BOM Creation:</strong></p>
-<ul>
-<li>Surface: {payload['product']['width'] * payload['product']['height']} mm² ({(payload['product']['width'] * payload['product']['height'])/1000000:.4f} m²)</li>
-<li>Circumference: {2 * (payload['product']['width'] + payload['product']['height'])} mm ({2 * (payload['product']['width'] + payload['product']['height'])/1000:.2f} m)</li>
-<li>BOM components: {bom_components_count} items</li>
-<li>BOM operations: {bom_operations_count} items</li>
-</ul>
-
-<p><strong>Components Processed:</strong></p>
-<ul>{''.join(component_list_items)}</ul>
+<p><strong>🛍️ Products Created:</strong></p>
+{''.join(products_html)}
 
 <p><strong>Final Return Data:</strong></p>
 <ul>
 <li>message: '{payload_type} order processing finished'</li>
 <li>partner_id: {partner_id}</li>
-<li>product_id: {product_id}</li>
-<li>bom_id: {bom_id}</li>
+<li>products_created: {len(created_products)}</li>
 <li>order_id: {order_id}</li>
 <li>payload_type: {payload_type}</li>
 <li>status: 'success'</li>
@@ -744,8 +805,9 @@ def handle_web_order():
         response_data = {
             'message': f'{payload_type} order processing finished',
             'partner_id': partner_id,
-            'product_id': product_id,
-            'bom_id': bom_id,
+            'products_created': len(created_products),
+            'product_ids': [p['product_id'] for p in created_products],
+            'bom_ids': [p['bom_id'] for p in created_products],
             'order_id': order_id,
             'payload_type': payload_type,
             'status': 'success'
