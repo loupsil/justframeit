@@ -150,7 +150,7 @@ def get_or_create_customer(models, uid, customer_data):
     logger.info(f"Created new customer '{customer_data['name']}' with email {customer_data['email']} (ID: {partner_id})")
     return partner_id, 'created'
 
-def create_product_and_bom(models, uid, product_name, product_reference, width, height, price, components):
+def create_product_and_bom(models, uid, product_name, product_reference, width, height, price, components, product_template_attribute_value_ids=None):
     """
     Shared function to create product and BOM with components and operations.
 
@@ -163,6 +163,7 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
         height: Product height in mm
         price: Product price
         components: List of component dictionaries with 'name' and 'reference' keys
+        product_template_attribute_value_ids: List of attribute value IDs for variants (optional)
 
     Returns:
         tuple: (product_id, bom_id, bom_components_count, bom_operations_count, skipped_components)
@@ -184,6 +185,11 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
         'default_code': product_reference,
         'categ_id': 8,  # Set category ID to 8
     }
+
+    # Add variant attributes if provided (for variant products)
+    if product_template_attribute_value_ids:
+        product_vals['product_template_attribute_value_ids'] = [(6, 0, product_template_attribute_value_ids)]
+        logger.info(f"Including {len(product_template_attribute_value_ids)} variant attribute(s) in new product")
 
     logger.debug(f"Product creation values: {product_vals}")
     product_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
@@ -1159,7 +1165,7 @@ def handle_odoo_order():
             order_line = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
                 'sale.order.line', 'read',
                 [order_line_id],
-                {'fields': ['product_id', 'price_unit', 'product_uom_qty']})
+                {'fields': ['product_id', 'price_unit', 'product_uom_qty', 'product_updatable', 'product_template_attribute_value_ids']})
 
             product_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
                 'product.product', 'read',
@@ -1177,23 +1183,56 @@ def handle_odoo_order():
             logger.info(f"Extracted product specs: {width}mm x {height}mm, €{price}, qty: {quantity}")
             logger.info(f"Original product: {original_product_name} ({original_product_code})")
 
+            # Check if product is updatable (variants are not updatable)
+            product_updatable = order_line[0]['product_updatable']
+            product_template_attribute_value_ids = order_line[0]['product_template_attribute_value_ids']
+
+            if not product_updatable:
+                logger.warning(f"Product '{original_product_name}' is a variant and not updatable. Order line cannot be modified with new product, but BOM processing will continue.")
+                # Add message to sale order chatter
+                try:
+                    models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                        'sale.order', 'message_post',
+                        [sale_order_id],
+                        {'body': f"⚠️ Product '{original_product_name}' is a variant and cannot be updated on order line {order_line_id}. A new BOM has been created but the order line product remains unchanged."})
+                except Exception as e:
+                    logger.warning(f"Failed to post chatter message for unupdatable product: {e}")
+
             # Get BOM for the existing product
             logger.info("Finding BOM for existing product")
-            bom_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                'mrp.bom', 'search',
-                [[['product_tmpl_id', '=', product_info[0]['product_tmpl_id'][0]]]])
+
+           
+            product_id = order_line[0]['product_id'][0]
+            product_tmpl_id = product_info[0]['product_tmpl_id'][0]
+            
+            # Check if this is a variant product (has specific attribute values)
+            is_variant = len(product_template_attribute_value_ids) > 0
+
+            if is_variant:
+                # For variant products, search for BOMs specific to this variant (this is the way Odoo is structured, cfr from view of BOM)
+                logger.info(f"Product is a variant (ID: {product_id}), searching for variant-specific BOM")
+                bom_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                    'mrp.bom', 'search',
+                    [[['product_id', '=', product_id]]])
+            else:
+                # For non-variant products, search by template (this is the way Odoo is structured, cfr from view of BOM)
+                logger.info(f"Product is not a variant, searching for template BOM")
+                bom_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                    'mrp.bom', 'search',
+                    [[['product_tmpl_id', '=', product_tmpl_id]]])
 
             if not bom_ids:
-                logger.warning(f"No BOM found for product '{original_product_name}' - skipping this line")
+                bom_type = "variant-specific" if is_variant else "template"
+                logger.warning(f"No {bom_type} BOM found for product '{original_product_name}' - skipping this line")
                 processed_lines.append({
                     'order_line_id': order_line_id,
                     'original_product': original_product_name,
                     'status': 'skipped',
-                    'reason': 'No BOM found'
+                    'reason': f'No {bom_type} BOM found'
                 })
                 continue
 
-            logger.info(f"Found BOM ID: {bom_ids[0]}")
+            logger.info(f"Found BOM ID: {bom_ids[0]} ({'variant-specific' if is_variant else 'template'} BOM)")
 
             bom_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
                 'mrp.bom', 'read',
@@ -1292,18 +1331,29 @@ def handle_odoo_order():
                 # This exception is expected - the method completes successfully despite raising it
                 logger.info(f"BOM cost computation completed for Product Template ID {product_tmpl_id}")
 
-            # Update existing sale order line with new product
-            logger.info(f"Updating order line {order_line_id} with new product")
-            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                'sale.order', 'write',
-                [sale_order_id, {
-                    'order_line': [(1, order_line_id, {
-                        'product_id': product_id,
-                        'product_uom_qty': quantity,
-                        'price_unit': price
-                    })]
-                }])
-            logger.info(f"Order line {order_line_id} updated successfully with quantity: {quantity}")
+            # Update existing sale order line with new product (only if product is updatable)
+            if product_updatable:
+                logger.info(f"Updating order line {order_line_id} with new product")
+                models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                    'sale.order', 'write',
+                    [sale_order_id, {
+                        'order_line': [(1, order_line_id, {
+                            'product_id': product_id,
+                            'product_uom_qty': quantity,
+                            'price_unit': price
+                        })]
+                    }])
+                logger.info(f"Order line {order_line_id} updated successfully with quantity: {quantity}")
+            else:
+                logger.info(f"Skipping order line {order_line_id} update because product is not updatable (variant)")
+                # Add additional message to sale order chatter about the successful BOM creation
+                try:
+                    models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                        'sale.order', 'message_post',
+                        [sale_order_id],
+                        {'body': f"✅ New BOM created for variant product '{original_product_name}' (Order line {order_line_id}). Product ID: {product_id}, BOM ID: {bom_id}."})
+                except Exception as e:
+                    logger.warning(f"Failed to post success message for variant product: {e}")
 
             # Track processed line results
             processed_lines.append({
