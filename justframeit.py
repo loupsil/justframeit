@@ -1188,15 +1188,24 @@ def handle_odoo_order():
             product_template_attribute_value_ids = order_line[0]['product_template_attribute_value_ids']
 
             if not product_updatable:
-                logger.warning(f"Product '{original_product_name}' is a variant and not updatable. Order line cannot be modified with new product, but BOM processing will continue.")
+                logger.warning(f"Product '{original_product_name}' is a variant and not updatable. Processing blocked for this order line.")
                 # Add message to sale order chatter
                 try:
                     models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
                         'sale.order', 'message_post',
                         [sale_order_id],
-                        {'body': f"⚠️ Product '{original_product_name}' is a variant and cannot be updated on order line {order_line_id}. A new BOM has been created but the order line product remains unchanged."})
+                        {'body': f"⚠️ Product '{original_product_name}' is a variant and cannot be updated on order line {order_line_id}. Processing has been blocked for this order line."})
                 except Exception as e:
                     logger.warning(f"Failed to post chatter message for unupdatable product: {e}")
+
+                # Track skipped line due to unupdatable product
+                processed_lines.append({
+                    'order_line_id': order_line_id,
+                    'original_product': original_product_name,
+                    'status': 'skipped',
+                    'reason': 'Product is unupdatable (variant)'
+                })
+                continue
 
             # Get BOM for the existing product
             logger.info("Finding BOM for existing product")
