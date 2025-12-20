@@ -64,6 +64,52 @@ def get_uid():
         logger.error(f"Failed to authenticate with Odoo: {str(e)}")
         raise
 
+def get_next_product_sequence(models, uid):
+    """
+    Get the next product sequence number in format PR000XXX.
+    
+    Searches for all products with names matching the PR format (e.g., PR000001, PR000002)
+    and returns the next available sequence number.
+    
+    Args:
+        models: Odoo models proxy
+        uid: User ID
+        
+    Returns:
+        str: Next sequence number (e.g., 'PR000001', 'PR000124')
+    """
+    try:
+        # Search for products with names starting with 'PR' followed by digits
+        # We'll search for products matching the pattern and find the highest number
+        existing_products = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+            'product.product', 'search_read',
+            [[['name', '=like', 'PR______']]],  # Exactly 6 digits after PR
+            {'fields': ['name'], 'order': 'name desc', 'limit': 1})
+        
+        if existing_products:
+            # Extract the number from the highest product name
+            highest_name = existing_products[0]['name']
+            # Extract digits after 'PR'
+            try:
+                highest_number = int(highest_name[2:])  # Skip 'PR' prefix
+                next_number = highest_number + 1
+            except (ValueError, IndexError):
+                next_number = 1
+        else:
+            next_number = 1
+        
+        # Format as PR followed by 6 digits with leading zeros
+        sequence = f"PR{next_number:06d}"
+        logger.info(f"Generated next product sequence: {sequence}")
+        return sequence
+        
+    except Exception as e:
+        logger.warning(f"Failed to get next product sequence: {str(e)}. Using timestamp fallback.")
+        # Fallback to timestamp-based naming if sequence lookup fails
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        return f"PR_{timestamp}"
+
+
 def download_image_as_base64(image_url):
     """
     Download an image from URL and return it as base64 encoded string.
@@ -678,22 +724,18 @@ def handle_web_order():
         for product_index, product_data in enumerate(products):
             logger.info(f"--- Processing product {product_index + 1}/{len(products)} ---")
             
-            # Auto-generate product name and reference with timestamp if not provided
+            # Auto-generate product name and reference using sequence system if not provided
             product_name = product_data.get('name', '').strip() if product_data.get('name') else ''
             product_reference = product_data.get('reference', '').strip() if product_data.get('reference') else ''
 
-            # Use description from line item if available for product name
+            # Generate sequential product name (PR000XXX format)
             if not product_name:
-                description = product_data.get('description', '')
-                if description:
-                    product_name = f"{description} {timestamp}_{product_index + 1}"
-                else:
-                    product_name = f"Finished Product {timestamp}_{product_index + 1}"
+                product_name = get_next_product_sequence(models, uid)
                 logger.info(f"Auto-generated product name: {product_name}")
 
-            # If reference is empty, generate with timestamp
+            # Use same sequence for reference if not provided
             if not product_reference:
-                product_reference = f"FINISHED_PRODUCT_{timestamp}_{product_index + 1}"
+                product_reference = product_name  # Use the same PR sequence as reference
                 logger.info(f"Auto-generated product reference: {product_reference}")
 
             # Use shared function to create product and BOM
@@ -1268,14 +1310,10 @@ def handle_odoo_order():
 
             logger.info(f"Copied {len(components)} components from existing BOM")
 
-            # Generate timestamp for unique naming (include line index for uniqueness)
-            logger.info("Generating timestamp for new product naming")
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            unique_suffix = f"{timestamp}_{line_index + 1}"
-
-            # Create new product name and reference with timestamp
-            product_name = f"Finished Product {unique_suffix}"
-            product_reference = f"FINISHED_PRODUCT_{unique_suffix}"
+            # Generate sequential product name (PR000XXX format)
+            logger.info("Generating sequential product name")
+            product_name = get_next_product_sequence(models, uid)
+            product_reference = product_name  # Use the same PR sequence as reference
             logger.info(f"New product name: {product_name}")
             logger.info(f"New product reference: {product_reference}")
 
