@@ -3,6 +3,7 @@ import xmlrpc.client
 import os
 import json
 import base64
+import re
 from io import StringIO
 from dotenv import load_dotenv
 import logging
@@ -196,7 +197,92 @@ def get_or_create_customer(models, uid, customer_data):
     logger.info(f"Created new customer '{customer_data['name']}' with email {customer_data['email']} (ID: {partner_id})")
     return partner_id, 'created'
 
-def create_product_and_bom(models, uid, product_name, product_reference, width, height, price, components, product_template_attribute_value_ids=None):
+def get_visible_components_list(models, uid, components):
+    """
+    Get list of visible components (where x_studio_is_visible_in_portal_reports is True).
+    
+    Args:
+        models: Odoo models proxy
+        uid: User ID
+        components: List of component dictionaries with 'name' and 'reference' keys
+        
+    Returns:
+        list: List of formatted strings "[reference] component_name" for visible components
+    """
+    visible_components = []
+    
+    for component in components:
+        try:
+            # Search for the component in Odoo
+            component_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                'product.product', 'search',
+                [[['x_studio_product_code', '=', component['reference']]]])
+            
+            if component_ids:
+                # Get component details including visibility flag
+                component_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                    'product.product', 'read',
+                    [component_ids[0]],
+                    {'fields': ['name', 'x_studio_product_code', 'x_studio_is_visible_in_portal_reports']})
+                
+                if component_info and component_info[0].get('x_studio_is_visible_in_portal_reports'):
+                    # Component is visible, add to list
+                    comp_ref = component_info[0].get('x_studio_product_code', component['reference'])
+                    comp_name = component_info[0].get('name', component['name'])
+                    visible_components.append(f"[{comp_ref}] {comp_name}")
+                    logger.debug(f"Found visible component: [{comp_ref}] {comp_name}")
+        except Exception as e:
+            logger.warning(f"Failed to check visibility for component {component['reference']}: {str(e)}")
+    
+    logger.info(f"Found {len(visible_components)} visible component(s)")
+    return visible_components
+
+
+def build_order_line_description_odoo(original_product_name, width, height, visible_components):
+    """
+    Build order line description for Odoo orders.
+    Uses original template name + dimensions + "Materiaal:" + visible components.
+    
+    Args:
+        original_product_name: Original product template name
+        width: Product width in mm
+        height: Product height in mm
+        visible_components: List of formatted visible component strings
+        
+    Returns:
+        str: Description string for order line
+    """
+    # Convert mm to cm for display
+    width_cm = width / 10
+    height_cm = height / 10
+    
+    # Start with original product name and dimensions
+    description = f"{original_product_name} ({width_cm}x{height_cm})"
+    
+    # Add visible components with "Materiaal:" prefix
+    if visible_components:
+        description += " - Materiaal: " + " - ".join(visible_components)
+    
+    logger.info(f"Built Odoo order line description with {len(visible_components)} visible component(s)")
+    return description
+
+
+def build_visible_components_suffix(visible_components):
+    """
+    Build the visible components suffix to append to existing descriptions.
+    
+    Args:
+        visible_components: List of formatted visible component strings
+        
+    Returns:
+        str: Suffix string with "Materiaal:" and visible components, or empty string if none
+    """
+    if visible_components:
+        return "\n\nMateriaal: " + " - ".join(visible_components)
+    return ""
+
+
+def create_product_and_bom(models, uid, product_name, product_reference, width, height, price, components, product_template_attribute_value_ids=None, original_template_name=None):
     """
     Shared function to create product and BOM with components and operations.
 
@@ -210,6 +296,7 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
         price: Product price
         components: List of component dictionaries with 'name' and 'reference' keys
         product_template_attribute_value_ids: List of attribute value IDs for variants (optional)
+        original_template_name: Original template/variant name to store for reference (optional)
 
     Returns:
         tuple: (product_id, bom_id, bom_components_count, bom_operations_count, skipped_components)
@@ -219,6 +306,8 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
     logger.info(f"Product: {product_name} (ref: {product_reference})")
     logger.info(f"Dimensions: {width}mm x {height}mm, Price: €{price}")
     logger.info(f"Components: {len(components)} items")
+    if original_template_name:
+        logger.info(f"Original template name: {original_template_name}")
 
     # Create product
     logger.info("Creating product in Odoo")
@@ -231,6 +320,10 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
         'default_code': product_reference,
         'categ_id': 8,  # Set category ID to 8
     }
+    
+    # Store original template name in description_sale field for future reference
+    if original_template_name:
+        product_vals['description_sale'] = f"Original: {original_template_name}"
 
     # Add variant attributes if provided (for variant products)
     if product_template_attribute_value_ids:
@@ -852,7 +945,11 @@ def handle_web_order():
             # Get discount percentage (default to 0 if not specified)
             discount = product_data.get('discount', 0)
             
-            # Add order line with correct quantity and discount
+            # Get visible components for later appending to description
+            logger.info("Getting visible components for order line description")
+            visible_components = get_visible_components_list(models, uid, product_data['components'])
+            
+            # Add order line with correct quantity and discount (no name - let Odoo compute default)
             order_line_vals = {
                 'product_id': product_id,
                 'product_uom_qty': qty,
@@ -881,6 +978,7 @@ def handle_web_order():
                 'qty': qty,
                 'discount': discount,
                 'components': product_data['components'],
+                'visible_components': visible_components,
                 'photo_url': photo_url,
                 'image_base64': image_base64,
                 'image_attachment_id': image_attachment_id
@@ -898,6 +996,32 @@ def handle_web_order():
         logger.debug(f"Sale order values: partner_id={partner_id}, {len(order_lines)} order line(s)")
         order_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
             'sale.order', 'create', [order_vals])
+
+        # Update order lines to append visible components to descriptions
+        logger.info("Updating order lines with visible components")
+        sale_order_data = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+            'sale.order', 'read', [order_id], {'fields': ['order_line']})
+        order_line_ids = sale_order_data[0]['order_line']
+        
+        for line_idx, order_line_id in enumerate(order_line_ids):
+            if line_idx < len(created_products):
+                prod = created_products[line_idx]
+                visible_comps = prod.get('visible_components', [])
+                
+                if visible_comps:
+                    # Read current description
+                    line_data = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                        'sale.order.line', 'read', [order_line_id], {'fields': ['name']})
+                    current_description = line_data[0].get('name', '')
+                    
+                    # Append visible components suffix
+                    components_suffix = build_visible_components_suffix(visible_comps)
+                    new_description = current_description + components_suffix
+                    
+                    # Update order line description
+                    models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                        'sale.order.line', 'write', [[order_line_id], {'name': new_description}])
+                    logger.info(f"Updated order line {order_line_id} with {len(visible_comps)} visible component(s)")
 
         logger.info("Web order processing completed successfully")
         logger.info(f"Results - Customer ID: {partner_id}, Products: {len(created_products)}, Order ID: {order_id}")
@@ -1202,28 +1326,67 @@ def handle_odoo_order():
         for line_index, order_line_id in enumerate(order_line_ids):
             logger.info(f"--- Processing order line {line_index + 1}/{len(order_line_ids)} (ID: {order_line_id}) ---")
 
-            # Get order line details
+            # Get order line details (including 'name' field for description)
             logger.info("Reading order line details")
             order_line = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
                 'sale.order.line', 'read',
                 [order_line_id],
-                {'fields': ['product_id', 'price_unit', 'product_uom_qty', 'product_updatable', 'product_template_attribute_value_ids']})
+                {'fields': ['product_id', 'price_unit', 'product_uom_qty', 'product_updatable', 'product_template_attribute_value_ids', 'name']})
 
             product_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
                 'product.product', 'read',
                 [order_line[0]['product_id'][0]],
-                {'fields': ['x_studio_width', 'x_studio_height', 'name', 'default_code', 'product_tmpl_id']})
+                {'fields': ['x_studio_width', 'x_studio_height', 'name', 'display_name', 'default_code', 'product_tmpl_id', 'description_sale']})
 
             # Extract product details
             width = product_info[0]['x_studio_width']
             height = product_info[0]['x_studio_height']
             price = order_line[0]['price_unit']
             quantity = order_line[0]['product_uom_qty']
-            original_product_name = product_info[0]['name']
+            # Use display_name to get full variant name (e.g., "Kader op maat (Artglass AR99)")
+            # Fallback to name if display_name is not available
+            current_product_name = product_info[0].get('display_name') or product_info[0]['name']
             original_product_code = product_info[0]['default_code']
+            order_line_description = order_line[0].get('name', '')
+            product_description_sale = product_info[0].get('description_sale', '')
+
+            # Check if current product is already a PR product (re-execution scenario)
+            # PR products have names like PR000001, PR000002, or display_name like [PR000001] PR000001
+            # We check if the name contains the PR pattern anywhere
+            pr_pattern = r'PR\d{6}'
+            is_pr_product = bool(re.search(pr_pattern, current_product_name or ''))
+            
+            if is_pr_product:
+                # This is a re-execution - try to recover original template name
+                original_product_name = None
+                
+                # Method 1: Try to get from the PR product's description_sale field
+                # Format: "Original: Kader op maat (Artglass AR99)"
+                if product_description_sale and product_description_sale.startswith('Original: '):
+                    original_product_name = product_description_sale[10:].strip()  # Remove "Original: " prefix
+                    logger.info(f"Detected re-execution: Retrieved original template name '{original_product_name}' from product description_sale")
+                
+                # Method 2: Fallback - try to extract from order line description
+                if not original_product_name and order_line_description:
+                    dimension_pattern = r'^(.+?)\s*\(\d+\.?\d*x\d+\.?\d*\)'
+                    match = re.match(dimension_pattern, order_line_description)
+                    if match:
+                        extracted_name = match.group(1).strip()
+                        # Make sure we didn't just extract another PR product name
+                        if not re.search(pr_pattern, extracted_name):
+                            original_product_name = extracted_name
+                            logger.info(f"Detected re-execution: Extracted original template name '{original_product_name}' from order line description")
+                
+                # Method 3: Final fallback - use current product name
+                if not original_product_name:
+                    original_product_name = current_product_name
+                    logger.warning(f"Re-execution detected but couldn't recover original name. Using: {original_product_name}")
+            else:
+                original_product_name = current_product_name
 
             logger.info(f"Extracted product specs: {width}mm x {height}mm, €{price}, qty: {quantity}")
-            logger.info(f"Original product: {original_product_name} ({original_product_code})")
+            logger.info(f"Current product: {current_product_name} ({original_product_code})")
+            logger.info(f"Original template name for description: {original_product_name}")
 
             # Check if product is updatable (variants are not updatable)
             product_updatable = order_line[0]['product_updatable']
@@ -1322,7 +1485,8 @@ def handle_odoo_order():
             product_id, bom_id, bom_components_count, bom_operations_count, skipped_components = create_product_and_bom(
                 models, uid,
                 product_name, product_reference,
-                width, height, price, components
+                width, height, price, components,
+                original_template_name=original_product_name  # Store original name for future re-executions
             )
             
             # Log skipped components if any
@@ -1378,6 +1542,16 @@ def handle_odoo_order():
                 # This exception is expected - the method completes successfully despite raising it
                 logger.info(f"BOM cost computation completed for Product Template ID {product_tmpl_id}")
 
+            # Get visible components and build order line description
+            logger.info("Getting visible components for order line description")
+            visible_components = get_visible_components_list(models, uid, components)
+            
+            # Build description using ORIGINAL product name (not the new PR number)
+            logger.info("Building order line description with original product name")
+            order_line_description = build_order_line_description_odoo(
+                original_product_name, width, height, visible_components
+            )
+
             # Update existing sale order line with new product (only if product is updatable)
             if product_updatable:
                 logger.info(f"Updating order line {order_line_id} with new product")
@@ -1387,7 +1561,8 @@ def handle_odoo_order():
                         'order_line': [(1, order_line_id, {
                             'product_id': product_id,
                             'product_uom_qty': quantity,
-                            'price_unit': price
+                            'price_unit': price,
+                            'name': order_line_description
                         })]
                     }])
                 logger.info(f"Order line {order_line_id} updated successfully with quantity: {quantity}")
