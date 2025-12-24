@@ -294,7 +294,9 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
         width: Product width in mm
         height: Product height in mm
         price: Product price
-        components: List of component dictionaries with 'name' and 'reference' keys
+        components: List of component dictionaries with 'name' and 'reference' keys.
+                    Optionally includes 'qty' key - if provided and not equal to 1,
+                    this quantity is used directly without recalculation.
         product_template_attribute_value_ids: List of attribute value IDs for variants (optional)
         original_template_name: Original template/variant name to store for reference (optional)
 
@@ -383,8 +385,13 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
             [component_id],
             {'fields': ['x_studio_price_computation', 'x_studio_associated_service', 'x_studio_associated_service_duration_rule']})
 
-        # Calculate quantity based on price computation method
-        if component_info and component_info[0]['x_studio_price_computation'] == 'Circumference':
+        # Check if component has an existing quantity (from original BOM) that's not 1
+        # If so, use it directly without recalculation
+        if 'qty' in component and component['qty'] != 1:
+            quantity = component['qty']
+            logger.debug(f"Quantity from original BOM: {quantity} (preserved without recalculation)")
+        # Otherwise, calculate quantity based on price computation method
+        elif component_info and component_info[0]['x_studio_price_computation'] == 'Circumference':
             quantity = circumference_m
             logger.debug(f"Quantity calculation: Circumference method → {quantity} m")
         elif component_info and component_info[0]['x_studio_price_computation'] == 'Surface':
@@ -1388,6 +1395,27 @@ def handle_odoo_order():
             logger.info(f"Current product: {current_product_name} ({original_product_code})")
             logger.info(f"Original template name for description: {original_product_name}")
 
+            # Check if quantity is different than 1 (preset products - skip processing)
+            if quantity != 1:
+                logger.info(f"Product '{current_product_name}' has quantity {quantity} (preset). Skipping processing for this order line.")
+                # Add message to sale order chatter
+                try:
+                    models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                        'sale.order', 'message_post',
+                        [sale_order_id],
+                        {'body': f"ℹ️ Product '{current_product_name}' has quantity {quantity} (preset). Processing has been skipped for this order line."})
+                except Exception as e:
+                    logger.warning(f"Failed to post chatter message for preset product: {e}")
+
+                # Track skipped line due to preset (quantity != 1)
+                processed_lines.append({
+                    'order_line_id': order_line_id,
+                    'original_product': current_product_name,
+                    'status': 'skipped',
+                    'reason': f'Preset product (quantity: {quantity})'
+                })
+                continue
+
             # Check if product is updatable (variants are not updatable)
             product_updatable = order_line[0]['product_updatable']
             product_template_attribute_value_ids = order_line[0]['product_template_attribute_value_ids']
@@ -1460,16 +1488,23 @@ def handle_odoo_order():
                 bom_line = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
                     'mrp.bom.line', 'read',
                     [bom_line_id],
-                    {'fields': ['product_id']})
+                    {'fields': ['product_id', 'product_qty']})
                 component_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
                     'product.product', 'read',
                     [bom_line[0]['product_id'][0]],
                     {'fields': ['name', 'x_studio_product_code']})
-                components.append({
+                component_data = {
                     'name': component_info[0]['name'],
                     'reference': component_info[0]['x_studio_product_code']
-                })
-                logger.debug(f"Copied component: {component_info[0]['name']} ({component_info[0]['x_studio_product_code']})")
+                }
+                # Include original quantity if it's not 1 (to preserve it without recalculation)
+                original_qty = bom_line[0].get('product_qty', 1)
+                if original_qty != 1:
+                    component_data['qty'] = original_qty
+                    logger.debug(f"Copied component: {component_info[0]['name']} ({component_info[0]['x_studio_product_code']}) with original qty: {original_qty}")
+                else:
+                    logger.debug(f"Copied component: {component_info[0]['name']} ({component_info[0]['x_studio_product_code']})")
+                components.append(component_data)
 
             logger.info(f"Copied {len(components)} components from existing BOM")
 
