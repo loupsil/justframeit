@@ -200,6 +200,7 @@ def get_or_create_customer(models, uid, customer_data):
 def get_visible_components_list(models, uid, components):
     """
     Get list of visible components (where x_studio_is_visible_in_portal_reports is True).
+    Uses batch API call for performance.
     
     Args:
         models: Odoo models proxy
@@ -209,33 +210,37 @@ def get_visible_components_list(models, uid, components):
     Returns:
         list: List of formatted strings "[reference] component_name" for visible components
     """
-    visible_components = []
+    if not components:
+        return []
     
-    for component in components:
-        try:
-            # Search for the component in Odoo
-            component_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                'product.product', 'search',
-                [[['x_studio_product_code', '=', component['reference']]]])
-            
-            if component_ids:
-                # Get component details including visibility flag
-                component_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                    'product.product', 'read',
-                    [component_ids[0]],
-                    {'fields': ['name', 'x_studio_product_code', 'x_studio_is_visible_in_portal_reports']})
-                
-                if component_info and component_info[0].get('x_studio_is_visible_in_portal_reports'):
-                    # Component is visible, add to list
-                    comp_ref = component_info[0].get('x_studio_product_code', component['reference'])
-                    comp_name = component_info[0].get('name', component['name'])
-                    visible_components.append(f"[{comp_ref}] {comp_name}")
-                    logger.debug(f"Found visible component: [{comp_ref}] {comp_name}")
-        except Exception as e:
-            logger.warning(f"Failed to check visibility for component {component['reference']}: {str(e)}")
+    # Collect all references for batch search
+    references = [c['reference'] for c in components if c.get('reference')]
     
-    logger.info(f"Found {len(visible_components)} visible component(s)")
-    return visible_components
+    if not references:
+        return []
+    
+    try:
+        # Single batch search for all components
+        all_component_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+            'product.product', 'search_read',
+            [[['x_studio_product_code', 'in', references]]],
+            {'fields': ['name', 'x_studio_product_code', 'x_studio_is_visible_in_portal_reports']})
+        
+        # Filter visible components and build result list
+        visible_components = []
+        for comp_info in all_component_info:
+            if comp_info.get('x_studio_is_visible_in_portal_reports'):
+                comp_ref = comp_info.get('x_studio_product_code', '')
+                comp_name = comp_info.get('name', '')
+                visible_components.append(f"[{comp_ref}] {comp_name}")
+                logger.debug(f"Found visible component: [{comp_ref}] {comp_name}")
+        
+        logger.info(f"Found {len(visible_components)} visible component(s) from {len(references)} checked")
+        return visible_components
+        
+    except Exception as e:
+        logger.warning(f"Failed to batch check visibility for components: {str(e)}")
+        return []
 
 
 def build_order_line_description_odoo(original_product_name, width, height, visible_components):
