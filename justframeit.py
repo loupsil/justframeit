@@ -360,16 +360,60 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
     logger.info("Processing components for BOM")
     skipped_components = []  # Track skipped components for logging
     
+    # BATCH OPTIMIZATION: Fetch all components, services, and duration rules upfront
+    # instead of making 2-4 API calls per component
+    
+    # Step 1: Collect all references and batch search_read all components
+    references = [c['reference'] for c in components if c.get('reference')]
+    logger.info(f"Batch fetching {len(references)} components by reference")
+    
+    all_component_data = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+        'product.product', 'search_read',
+        [[['x_studio_product_code', 'in', references]]],
+        {'fields': ['id', 'x_studio_product_code', 'x_studio_price_computation', 
+                    'x_studio_associated_service', 'x_studio_associated_service_duration_rule']})
+    
+    # Create lookup by reference
+    components_by_ref = {c['x_studio_product_code']: c for c in all_component_data}
+    logger.info(f"Found {len(all_component_data)} components in Odoo")
+    
+    # Step 2: Collect all unique service IDs and duration rule IDs for batch fetch
+    service_ids = set()
+    duration_rule_ids = set()
+    for comp_data in all_component_data:
+        if comp_data.get('x_studio_associated_service'):
+            service_ids.add(comp_data['x_studio_associated_service'][0])
+        if comp_data.get('x_studio_associated_service_duration_rule'):
+            duration_rule_ids.update(comp_data['x_studio_associated_service_duration_rule'])
+    
+    # Step 3: Batch fetch all services
+    services_by_id = {}
+    if service_ids:
+        logger.info(f"Batch fetching {len(service_ids)} services")
+        all_services = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+            'x_services', 'read',
+            [list(service_ids)],
+            {'fields': ['x_name', 'x_studio_associated_work_center']})
+        services_by_id = {s['id']: s for s in all_services}
+    
+    # Step 4: Batch fetch all duration rules
+    duration_rules_by_id = {}
+    if duration_rule_ids:
+        logger.info(f"Batch fetching {len(duration_rule_ids)} duration rules")
+        all_duration_rules = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+            'x_services_duration_rules', 'read',
+            [list(duration_rule_ids)],
+            {'fields': ['x_studio_quantity', 'x_duurtijd_totaal']})
+        duration_rules_by_id = {r['id']: r for r in all_duration_rules}
+    
+    # Step 5: Process components using batch-fetched data
     for i, component in enumerate(components, 1):
         logger.info(f"Processing component {i}/{len(components)}: {component['name']} (ref: {component['reference']})")
 
-        # Search for existing component
-        logger.debug(f"Searching for component with x_studio_product_code: {component['reference']}")
-        component_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-            'product.product', 'search',
-            [[['x_studio_product_code', '=', component['reference']]]])
-
-        if not component_ids:
+        # Look up component from batch data
+        component_info = components_by_ref.get(component['reference'])
+        
+        if not component_info:
             # Log warning and skip this component instead of crashing
             skip_message = f"Component '{component['name']}' with reference '{component['reference']}' not found in Odoo - SKIPPED"
             logger.warning(skip_message)
@@ -380,15 +424,8 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
             })
             continue  # Skip to next component
 
-        component_id = component_ids[0]
+        component_id = component_info['id']
         logger.info(f"Found component ID: {component_id}")
-
-        # Get component details to check price computation method and associated service
-        logger.debug(f"Reading component details for ID: {component_id}")
-        component_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-            'product.product', 'read',
-            [component_id],
-            {'fields': ['x_studio_price_computation', 'x_studio_associated_service', 'x_studio_associated_service_duration_rule']})
 
         # Check if component has an existing quantity (from original BOM) that's not 1
         # If so, use it directly without recalculation
@@ -396,10 +433,10 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
             quantity = component['qty']
             logger.debug(f"Quantity from original BOM: {quantity} (preserved without recalculation)")
         # Otherwise, calculate quantity based on price computation method
-        elif component_info and component_info[0]['x_studio_price_computation'] == 'Circumference':
+        elif component_info.get('x_studio_price_computation') == 'Circumference':
             quantity = circumference_m
             logger.debug(f"Quantity calculation: Circumference method → {quantity} m")
-        elif component_info and component_info[0]['x_studio_price_computation'] == 'Surface':
+        elif component_info.get('x_studio_price_computation') == 'Surface':
             quantity = surface_m2
             logger.debug(f"Quantity calculation: Surface method → {quantity} m²")
         else:
@@ -416,26 +453,26 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
         }))
         logger.info("Added component to BOM")
 
-        # Handle associated service/operation
-        if component_info[0]['x_studio_associated_service']:
-            service_id = component_info[0]['x_studio_associated_service'][0]
+        # Handle associated service/operation using batch-fetched data
+        if component_info.get('x_studio_associated_service'):
+            service_id = component_info['x_studio_associated_service'][0]
             logger.info(f"Processing associated service ID: {service_id}")
 
-            # Get service details
-            logger.debug(f"Reading service details for ID: {service_id}")
-            service_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                'x_services', 'read',
-                [service_id],
-                {'fields': ['x_name', 'x_studio_associated_work_center']})
+            # Get service details from batch data
+            service_info = services_by_id.get(service_id)
+            if not service_info:
+                logger.warning(f"Service ID {service_id} not found in batch data - skipping operation")
+                continue
+                
+            logger.debug(f"Service info: {service_info['x_name']}")
 
-            logger.debug(f"Service info: {service_info[0]['x_name']}")
+            # Get duration rules from batch data
+            duration_rule_ids_for_component = component_info.get('x_studio_associated_service_duration_rule', [])
+            duration_rules = [duration_rules_by_id[rid] for rid in duration_rule_ids_for_component if rid in duration_rules_by_id]
 
-            # Get duration rules directly from component
-            logger.debug("Reading duration rules")
-            duration_rules = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                'x_services_duration_rules', 'read',
-                [component_info[0]['x_studio_associated_service_duration_rule']],
-                {'fields': ['x_studio_quantity', 'x_duurtijd_totaal']})
+            if not duration_rules:
+                logger.warning(f"No duration rules found for component {component['reference']} - skipping operation")
+                continue
 
             # Find appropriate duration based on x_studio_quantity
             relevant_value = quantity  # Use the calculated quantity (surface, circumference, or default)
@@ -449,14 +486,14 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
             minutes = int(duration_minutes)
             seconds = int((duration_minutes - minutes) * 60)
             odoo_display = f"{minutes:02d}:{seconds:02d}"
-            logger.info(f"Duration for {service_info[0]['x_name']}: {duration_seconds}s = {duration_minutes:.2f}min ({odoo_display})")
+            logger.info(f"Duration for {service_info['x_name']}: {duration_seconds}s = {duration_minutes:.2f}min ({odoo_display})")
 
             # Add operation to BOM
             logger.debug("Adding operation to BOM")
             bom_operations.append((0, 0, {
-                'name': service_info[0]['x_name'],
+                'name': service_info['x_name'],
                 'time_cycle_manual': duration_minutes,
-                'workcenter_id': service_info[0]['x_studio_associated_work_center'][0] if service_info[0]['x_studio_associated_work_center'] else False
+                'workcenter_id': service_info['x_studio_associated_work_center'][0] if service_info.get('x_studio_associated_work_center') else False
             }))
             logger.info("Added operation to BOM")
 
@@ -1335,20 +1372,31 @@ def handle_odoo_order():
         order_line_ids = sale_order[0]['order_line']
         processed_lines = []  # Track all processed line results
 
+        # BATCH OPTIMIZATION: Pre-fetch all order lines and products in 2 calls instead of 2N calls
+        logger.info(f"Batch fetching {len(order_line_ids)} order lines and their products")
+        all_order_lines = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+            'sale.order.line', 'read',
+            [order_line_ids],
+            {'fields': ['product_id', 'price_unit', 'product_uom_qty', 'product_updatable', 'product_template_attribute_value_ids', 'name']})
+        
+        # Get all product IDs and fetch in one batch call
+        all_product_ids = [line['product_id'][0] for line in all_order_lines]
+        all_products = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+            'product.product', 'read',
+            [all_product_ids],
+            {'fields': ['x_studio_width', 'x_studio_height', 'name', 'display_name', 'default_code', 'product_tmpl_id', 'description_sale']})
+        
+        # Create lookup dictionaries for O(1) access in loop
+        order_lines_by_id = {line['id']: line for line in all_order_lines}
+        products_by_id = {prod['id']: prod for prod in all_products}
+        logger.info(f"Batch fetch complete: {len(all_order_lines)} order lines, {len(all_products)} products")
+
         for line_index, order_line_id in enumerate(order_line_ids):
             logger.info(f"--- Processing order line {line_index + 1}/{len(order_line_ids)} (ID: {order_line_id}) ---")
 
-            # Get order line details (including 'name' field for description)
-            logger.info("Reading order line details")
-            order_line = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                'sale.order.line', 'read',
-                [order_line_id],
-                {'fields': ['product_id', 'price_unit', 'product_uom_qty', 'product_updatable', 'product_template_attribute_value_ids', 'name']})
-
-            product_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                'product.product', 'read',
-                [order_line[0]['product_id'][0]],
-                {'fields': ['x_studio_width', 'x_studio_height', 'name', 'display_name', 'default_code', 'product_tmpl_id', 'description_sale']})
+            # Get order line details from pre-fetched data
+            order_line = [order_lines_by_id[order_line_id]]
+            product_info = [products_by_id[order_line[0]['product_id'][0]]]
 
             # Extract product details
             width = product_info[0]['x_studio_width']
@@ -1486,29 +1534,41 @@ def handle_odoo_order():
                 [bom_ids[0]],
                 {'fields': ['bom_line_ids']})
 
-            # Get components from existing BOM
-            logger.info("Copying components from existing BOM")
+            # BATCH OPTIMIZATION: Get all BOM lines and their products in 2 calls instead of 2N calls
+            logger.info("Copying components from existing BOM (batch fetch)")
+            bom_line_ids = bom_info[0]['bom_line_ids']
+            
+            # Batch fetch all BOM lines in one call
+            all_bom_lines = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                'mrp.bom.line', 'read',
+                [bom_line_ids],
+                {'fields': ['product_id', 'product_qty']})
+            
+            # Batch fetch all component products in one call
+            component_product_ids = [line['product_id'][0] for line in all_bom_lines]
+            all_component_products = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                'product.product', 'read',
+                [component_product_ids],
+                {'fields': ['name', 'x_studio_product_code']})
+            
+            # Create lookup dict for component products
+            component_products_by_id = {prod['id']: prod for prod in all_component_products}
+            
+            # Build components list from batch data
             components = []
-            for bom_line_id in bom_info[0]['bom_line_ids']:
-                bom_line = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                    'mrp.bom.line', 'read',
-                    [bom_line_id],
-                    {'fields': ['product_id', 'product_qty']})
-                component_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                    'product.product', 'read',
-                    [bom_line[0]['product_id'][0]],
-                    {'fields': ['name', 'x_studio_product_code']})
+            for bom_line in all_bom_lines:
+                component_info = component_products_by_id[bom_line['product_id'][0]]
                 component_data = {
-                    'name': component_info[0]['name'],
-                    'reference': component_info[0]['x_studio_product_code']
+                    'name': component_info['name'],
+                    'reference': component_info['x_studio_product_code']
                 }
                 # Include original quantity if it's not 1 (to preserve it without recalculation)
-                original_qty = bom_line[0].get('product_qty', 1)
+                original_qty = bom_line.get('product_qty', 1)
                 if original_qty != 1:
                     component_data['qty'] = original_qty
-                    logger.debug(f"Copied component: {component_info[0]['name']} ({component_info[0]['x_studio_product_code']}) with original qty: {original_qty}")
+                    logger.debug(f"Copied component: {component_info['name']} ({component_info['x_studio_product_code']}) with original qty: {original_qty}")
                 else:
-                    logger.debug(f"Copied component: {component_info[0]['name']} ({component_info[0]['x_studio_product_code']})")
+                    logger.debug(f"Copied component: {component_info['name']} ({component_info['x_studio_product_code']})")
                 components.append(component_data)
 
             logger.info(f"Copied {len(components)} components from existing BOM")
