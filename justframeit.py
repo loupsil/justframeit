@@ -4,6 +4,7 @@ import os
 import json
 import base64
 import re
+import time
 from io import StringIO
 from dotenv import load_dotenv
 import logging
@@ -65,50 +66,34 @@ def get_uid():
         logger.error(f"Failed to authenticate with Odoo: {str(e)}")
         raise
 
-def get_next_product_sequence(models, uid):
+def generate_product_reference():
     """
-    Get the next product sequence number in format PR000XXX.
+    Generate a unique product reference using the current timestamp in microseconds.
     
-    Searches for all products with names matching the PR format (e.g., PR000001, PR000002)
-    and returns the next available sequence number.
+    Converts the Unix timestamp in microseconds to base36 (0-9, A-Z).
+    Each microsecond produces a unique reference (~10-11 characters).
     
-    Args:
-        models: Odoo models proxy
-        uid: User ID
-        
     Returns:
-        str: Next sequence number (e.g., 'PR000001', 'PR000124')
+        str: Unique product reference (e.g., 'HF4D2K8M1P')
     """
-    try:
-        # Search for products with names starting with 'PR' followed by digits
-        # We'll search for products matching the pattern and find the highest number
-        existing_products = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-            'product.product', 'search_read',
-            [[['name', '=like', 'PR______']]],  # Exactly 6 digits after PR
-            {'fields': ['name'], 'order': 'name desc', 'limit': 1})
-        
-        if existing_products:
-            # Extract the number from the highest product name
-            highest_name = existing_products[0]['name']
-            # Extract digits after 'PR'
-            try:
-                highest_number = int(highest_name[2:])  # Skip 'PR' prefix
-                next_number = highest_number + 1
-            except (ValueError, IndexError):
-                next_number = 1
-        else:
-            next_number = 1
-        
-        # Format as PR followed by 6 digits with leading zeros
-        sequence = f"PR{next_number:06d}"
-        logger.info(f"Generated next product sequence: {sequence}")
-        return sequence
-        
-    except Exception as e:
-        logger.warning(f"Failed to get next product sequence: {str(e)}. Using timestamp fallback.")
-        # Fallback to timestamp-based naming if sequence lookup fails
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        return f"PR_{timestamp}"
+    # Base36 alphabet: 0-9, A-Z (36 characters, uppercase only)
+    BASE36_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    
+    # Get current Unix timestamp in microseconds for unique reference
+    timestamp = int(time.time() * 1000000)
+    
+    # Convert timestamp to base36
+    if timestamp == 0:
+        reference = "0"
+    else:
+        reference = ""
+        num = timestamp
+        while num > 0:
+            reference = BASE36_CHARS[num % 36] + reference
+            num //= 36
+    
+    logger.info(f"Generated product reference: {reference}")
+    return reference
 
 
 def download_image_as_base64(image_url):
@@ -870,14 +855,14 @@ def handle_web_order():
             product_name = product_data.get('name', '').strip() if product_data.get('name') else ''
             product_reference = product_data.get('reference', '').strip() if product_data.get('reference') else ''
 
-            # Generate sequential product name (PR000XXX format)
+            # Generate product name (PR-XXXXXX format using base64 timestamp)
             if not product_name:
-                product_name = get_next_product_sequence(models, uid)
+                product_name = generate_product_reference()
                 logger.info(f"Auto-generated product name: {product_name}")
 
-            # Use same sequence for reference if not provided
+            # Use same reference if not provided
             if not product_reference:
-                product_reference = product_name  # Use the same PR sequence as reference
+                product_reference = product_name
                 logger.info(f"Auto-generated product reference: {product_reference}")
 
             # Use shared function to create product and BOM
@@ -1612,10 +1597,10 @@ def handle_odoo_order():
 
             logger.info(f"Copied {len(components)} components from existing BOM")
 
-            # Generate sequential product name (PR000XXX format)
-            logger.info("Generating sequential product name")
-            product_name = get_next_product_sequence(models, uid)
-            product_reference = product_name  # Use the same PR sequence as reference
+            # Generate product name (PR-XXXXXX format using base64 timestamp)
+            logger.info("Generating product reference")
+            product_name = generate_product_reference()
+            product_reference = product_name
             logger.info(f"New product name: {product_name}")
             logger.info(f"New product reference: {product_reference}")
 
