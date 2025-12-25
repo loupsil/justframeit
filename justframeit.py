@@ -350,26 +350,26 @@ def process_order_line_parallel(
         current_product_name = product_info[0].get('display_name') or product_info[0]['name']
         original_product_code = product_info[0]['default_code']
         order_line_description = order_line[0].get('name', '')
-        product_description_sale = product_info[0].get('description_sale', '')
+        # Normalize description_sale: Odoo returns False for empty fields, convert to empty string
+        raw_description_sale = product_info[0].get('description_sale')
+        product_description_sale = raw_description_sale if isinstance(raw_description_sale, str) and raw_description_sale.strip() else ''
         
-        # Check if current product is already a PR product (re-execution scenario)
-        pr_pattern = r'PR\d{6}'
-        is_pr_product = bool(re.search(pr_pattern, current_product_name or ''))
+        # Check if this is a re-execution scenario by checking if description_sale already has a value
+        # This indicates the product was previously processed and we should preserve the original template name
+        is_reexecution = bool(product_description_sale and product_description_sale.startswith('Original: '))
         
-        if is_pr_product:
-            original_product_name = None
-            if product_description_sale and product_description_sale.startswith('Original: '):
-                original_product_name = product_description_sale[10:].strip()
-                line_logger.info(f"Detected re-execution: Retrieved original template name '{original_product_name}' from product description_sale")
+        if is_reexecution:
+            # Extract original template name from description_sale
+            original_product_name = product_description_sale[10:].strip()
+            line_logger.info(f"Detected re-execution: Retrieved original template name '{original_product_name}' from product description_sale")
             
+            # Fallback to order line description if extraction failed
             if not original_product_name and order_line_description:
                 dimension_pattern = r'^(.+?)\s*\(\d+\.?\d*x\d+\.?\d*\)'
                 match = re.match(dimension_pattern, order_line_description)
                 if match:
-                    extracted_name = match.group(1).strip()
-                    if not re.search(pr_pattern, extracted_name):
-                        original_product_name = extracted_name
-                        line_logger.info(f"Detected re-execution: Extracted original template name '{original_product_name}' from order line description")
+                    original_product_name = match.group(1).strip()
+                    line_logger.info(f"Detected re-execution: Extracted original template name '{original_product_name}' from order line description")
             
             if not original_product_name:
                 original_product_name = current_product_name
@@ -500,6 +500,7 @@ def process_order_line_parallel(
             product_name, product_reference,
             width, height, price, components,
             original_template_name=original_product_name,
+            existing_description_sale=product_description_sale,
             line_logger=line_logger
         )
         
@@ -584,7 +585,7 @@ def process_order_line_parallel(
             pass
 
 
-def create_product_and_bom(models, uid, product_name, product_reference, width, height, price, components, product_template_attribute_value_ids=None, original_template_name=None, line_logger=None):
+def create_product_and_bom(models, uid, product_name, product_reference, width, height, price, components, product_template_attribute_value_ids=None, original_template_name=None, existing_description_sale=None, line_logger=None):
     """
     Shared function to create product and BOM with components and operations.
 
@@ -601,6 +602,8 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
                     this quantity is used directly without recalculation.
         product_template_attribute_value_ids: List of attribute value IDs for variants (optional)
         original_template_name: Original template/variant name to store for reference (optional)
+        existing_description_sale: Existing description_sale value to preserve (optional).
+                                   If provided and not empty, this value is used instead of generating a new one.
         line_logger: Optional logger instance for parallel processing
 
     Returns:
@@ -630,8 +633,14 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
     }
     
     # Store original template name in description_sale field for future reference
-    if original_template_name:
+    # Preserve existing description_sale if it's already set (never replace a non-null value)
+    # Use explicit check for non-empty string to handle Odoo's False returns for empty fields
+    if existing_description_sale and isinstance(existing_description_sale, str) and existing_description_sale.strip():
+        product_vals['description_sale'] = existing_description_sale
+        log.info(f"Preserving existing description_sale: {existing_description_sale}")
+    elif original_template_name:
         product_vals['description_sale'] = f"Original: {original_template_name}"
+        log.info(f"Setting new description_sale: Original: {original_template_name}")
 
     # Add variant attributes if provided (for variant products)
     if product_template_attribute_value_ids:
