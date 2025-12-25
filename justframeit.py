@@ -1391,6 +1391,47 @@ def handle_odoo_order():
         products_by_id = {prod['id']: prod for prod in all_products}
         logger.info(f"Batch fetch complete: {len(all_order_lines)} order lines, {len(all_products)} products")
 
+        # BATCH OPTIMIZATION: Pre-fetch all BOMs in 2 calls instead of N calls in loop
+        # Collect all product_ids and product_tmpl_ids
+        all_variant_product_ids = list(set(all_product_ids))  # product.product IDs for variant BOMs
+        all_template_ids = list(set(prod['product_tmpl_id'][0] for prod in all_products))  # product.template IDs for template BOMs
+        
+        # Batch search for variant BOMs (BOMs with specific product_id set)
+        logger.info(f"Batch searching BOMs for {len(all_variant_product_ids)} products and {len(all_template_ids)} templates")
+        variant_bom_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+            'mrp.bom', 'search',
+            [[['product_id', 'in', all_variant_product_ids]]])
+        
+        # Batch search for template BOMs (BOMs by product_tmpl_id)
+        template_bom_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+            'mrp.bom', 'search',
+            [[['product_tmpl_id', 'in', all_template_ids]]])
+        
+        # Fetch BOM details for both sets
+        all_bom_ids = list(set(variant_bom_ids + template_bom_ids))
+        all_boms = []
+        if all_bom_ids:
+            all_boms = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                'mrp.bom', 'read',
+                [all_bom_ids],
+                {'fields': ['product_id', 'product_tmpl_id', 'bom_line_ids']})
+        
+        # Build lookup dicts for O(1) access
+        # bom_by_product: for variant products (product_id is set)
+        # bom_by_template: for non-variant products (by product_tmpl_id)
+        bom_by_product = {}
+        bom_by_template = {}
+        for bom in all_boms:
+            if bom.get('product_id') and bom['product_id']:
+                bom_by_product[bom['product_id'][0]] = bom
+            if bom.get('product_tmpl_id') and bom['product_tmpl_id']:
+                # Only add to template dict if not already in product dict (variant takes precedence)
+                tmpl_id = bom['product_tmpl_id'][0]
+                if tmpl_id not in bom_by_template:
+                    bom_by_template[tmpl_id] = bom
+        
+        logger.info(f"BOM batch fetch complete: {len(bom_by_product)} variant BOMs, {len(bom_by_template)} template BOMs")
+
         for line_index, order_line_id in enumerate(order_line_ids):
             logger.info(f"--- Processing order line {line_index + 1}/{len(order_line_ids)} (ID: {order_line_id}) ---")
 
@@ -1493,8 +1534,8 @@ def handle_odoo_order():
                 })
                 continue
 
-            # Get BOM for the existing product
-            logger.info("Finding BOM for existing product")
+            # Get BOM for the existing product from pre-fetched data
+            logger.info("Finding BOM for existing product (from batch data)")
 
            
             product_id = order_line[0]['product_id'][0]
@@ -1503,20 +1544,19 @@ def handle_odoo_order():
             # Check if this is a variant product (has specific attribute values)
             is_variant = len(product_template_attribute_value_ids) > 0
 
+            # Look up BOM from pre-fetched dictionaries
+            bom_data = None
             if is_variant:
-                # For variant products, search for BOMs specific to this variant (this is the way Odoo is structured, cfr from view of BOM)
-                logger.info(f"Product is a variant (ID: {product_id}), searching for variant-specific BOM")
-                bom_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                    'mrp.bom', 'search',
-                    [[['product_id', '=', product_id]]])
-            else:
-                # For non-variant products, search by template (this is the way Odoo is structured, cfr from view of BOM)
-                logger.info(f"Product is not a variant, searching for template BOM")
-                bom_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                    'mrp.bom', 'search',
-                    [[['product_tmpl_id', '=', product_tmpl_id]]])
+                # For variant products, look up in variant BOM dict first
+                logger.info(f"Product is a variant (ID: {product_id}), looking up variant-specific BOM")
+                bom_data = bom_by_product.get(product_id)
+            
+            if not bom_data:
+                # For non-variant products, or if variant BOM not found, use template BOM
+                logger.info(f"Looking up template BOM for template ID: {product_tmpl_id}")
+                bom_data = bom_by_template.get(product_tmpl_id)
 
-            if not bom_ids:
+            if not bom_data:
                 bom_type = "variant-specific" if is_variant else "template"
                 logger.warning(f"No {bom_type} BOM found for product '{original_product_name}' - skipping this line")
                 processed_lines.append({
@@ -1527,12 +1567,11 @@ def handle_odoo_order():
                 })
                 continue
 
-            logger.info(f"Found BOM ID: {bom_ids[0]} ({'variant-specific' if is_variant else 'template'} BOM)")
+            bom_type_found = "variant-specific" if bom_data.get('product_id') and bom_data['product_id'][0] == product_id else "template"
+            logger.info(f"Found BOM ID: {bom_data['id']} ({bom_type_found} BOM)")
 
-            bom_info = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                'mrp.bom', 'read',
-                [bom_ids[0]],
-                {'fields': ['bom_line_ids']})
+            # bom_data already contains bom_line_ids from batch fetch
+            bom_info = [bom_data]
 
             # BATCH OPTIMIZATION: Get all BOM lines and their products in 2 calls instead of 2N calls
             logger.info("Copying components from existing BOM (batch fetch)")
