@@ -1617,54 +1617,13 @@ def handle_odoo_order():
             if skipped_components:
                 logger.warning(f"Order line {line_index + 1}: {len(skipped_components)} component(s) were skipped")
 
-            # Compute BOM cost for the newly created product
-            logger.info("Computing BOM cost for new product")
-            initial_cost = 0
-            new_cost = 0
-            # Note: button_bom_cost method raises an exception as expected behavior
-            try:
-                # Get the product template ID from the created product
-                product_data = models.execute_kw(
-                    ODOO_DB, uid, ODOO_API_KEY,
-                    'product.product', 'read', [product_id], {'fields': ['product_tmpl_id']}
-                )
-                product_tmpl_id = product_data[0]['product_tmpl_id'][0]
-
-                # Get initial cost before computing BOM
-                initial_cost = models.execute_kw(
-                    ODOO_DB, uid, ODOO_API_KEY,
-                    'product.template', 'read',
-                    [[product_tmpl_id]],
-                    {'fields': ['standard_price']}
-                )[0]['standard_price']
-
-                logger.info(f"Initial cost: €{initial_cost}")
-
-                # Compute BOM cost - method raises exception as expected
-                models.execute_kw(
-                    ODOO_DB, uid, ODOO_API_KEY,
-                    'product.template', 'button_bom_cost',
-                    [[product_tmpl_id]]
-                )
-
-                # Get new cost after computation
-                new_cost = models.execute_kw(
-                    ODOO_DB, uid, ODOO_API_KEY,
-                    'product.template', 'read',
-                    [[product_tmpl_id]],
-                    {'fields': ['standard_price']}
-                )[0]['standard_price']
-
-                logger.info(f"New cost after BOM computation: €{new_cost}")
-
-                if new_cost != initial_cost:
-                    logger.info("Cost change detected - BOM computation successful")
-                else:
-                    logger.info("No cost change detected after BOM computation")
-
-            except Exception as e:
-                # This exception is expected - the method completes successfully despite raising it
-                logger.info(f"BOM cost computation completed for Product Template ID {product_tmpl_id}")
+            # Get the product template ID from the created product (for deferred BOM cost computation)
+            product_data = models.execute_kw(
+                ODOO_DB, uid, ODOO_API_KEY,
+                'product.product', 'read', [product_id], {'fields': ['product_tmpl_id']}
+            )
+            new_product_tmpl_id = product_data[0]['product_tmpl_id'][0]
+            logger.info(f"New product template ID: {new_product_tmpl_id} (BOM cost will be computed at end)")
 
             # Get visible components and build order line description
             logger.info("Getting visible components for order line description")
@@ -1701,12 +1660,13 @@ def handle_odoo_order():
                 except Exception as e:
                     logger.warning(f"Failed to post success message for variant product: {e}")
 
-            # Track processed line results
+            # Track processed line results (costs will be computed after loop)
             processed_lines.append({
                 'order_line_id': order_line_id,
                 'original_product': original_product_name,
                 'original_product_code': original_product_code,
                 'new_product_id': product_id,
+                'new_product_tmpl_id': new_product_tmpl_id,  # Store for deferred BOM cost computation
                 'new_product_name': product_name,
                 'new_product_reference': product_reference,
                 'bom_id': bom_id,
@@ -1718,12 +1678,65 @@ def handle_odoo_order():
                 'skipped_components': skipped_components,
                 'bom_components_count': bom_components_count,
                 'bom_operations_count': bom_operations_count,
-                'initial_cost': initial_cost,
-                'new_cost': new_cost,
+                'initial_cost': 0,  # Will be populated after batch BOM cost computation
+                'new_cost': 0,      # Will be populated after batch BOM cost computation
                 'status': 'success'
             })
 
             logger.info(f"--- Completed processing order line {line_index + 1}/{len(order_line_ids)} ---")
+
+        # BATCH BOM COST COMPUTATION: Compute costs for all created products at once
+        # This is more efficient than computing during the loop (especially with many components)
+        successful_lines_for_cost = [line for line in processed_lines if line['status'] == 'success']
+        if successful_lines_for_cost:
+            logger.info(f"Computing BOM costs for {len(successful_lines_for_cost)} product template(s)")
+            
+            # Collect all template IDs for batch processing
+            template_ids_to_process = [line['new_product_tmpl_id'] for line in successful_lines_for_cost]
+            
+            # Get initial costs in one batch call
+            logger.info("Fetching initial costs for all templates")
+            initial_costs_data = models.execute_kw(
+                ODOO_DB, uid, ODOO_API_KEY,
+                'product.template', 'read',
+                [template_ids_to_process],
+                {'fields': ['id', 'standard_price']}
+            )
+            initial_costs_by_id = {item['id']: item['standard_price'] for item in initial_costs_data}
+            
+            # Compute BOM cost for each template
+            for tmpl_id in template_ids_to_process:
+                try:
+                    logger.info(f"Computing BOM cost for product template ID: {tmpl_id}")
+                    models.execute_kw(
+                        ODOO_DB, uid, ODOO_API_KEY,
+                        'product.template', 'button_bom_cost',
+                        [[tmpl_id]]
+                    )
+                except Exception as e:
+                    # This exception is expected - the method completes successfully despite raising it
+                    logger.info(f"BOM cost computation completed for Product Template ID {tmpl_id}")
+            
+            # Get new costs in one batch call
+            logger.info("Fetching new costs for all templates")
+            new_costs_data = models.execute_kw(
+                ODOO_DB, uid, ODOO_API_KEY,
+                'product.template', 'read',
+                [template_ids_to_process],
+                {'fields': ['id', 'standard_price']}
+            )
+            new_costs_by_id = {item['id']: item['standard_price'] for item in new_costs_data}
+            
+            # Update processed_lines with the computed costs
+            for line in processed_lines:
+                if line['status'] == 'success':
+                    tmpl_id = line['new_product_tmpl_id']
+                    line['initial_cost'] = initial_costs_by_id.get(tmpl_id, 0)
+                    line['new_cost'] = new_costs_by_id.get(tmpl_id, 0)
+                    if line['new_cost'] != line['initial_cost']:
+                        logger.info(f"Template {tmpl_id}: Cost changed €{line['initial_cost']} → €{line['new_cost']}")
+                    else:
+                        logger.info(f"Template {tmpl_id}: No cost change (€{line['new_cost']})")
 
         # Trigger price update based on pricelist (once for entire order)
         logger.info("Triggering price update based on pricelist")
