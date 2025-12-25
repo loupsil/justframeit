@@ -249,7 +249,7 @@ def get_visible_components_list(models, uid, components, line_logger=None):
         return []
 
 
-def build_order_line_description_odoo(original_product_name, width, height, visible_components):
+def build_order_line_description_odoo(original_product_name, width, height, visible_components, line_logger=None):
     """
     Build order line description for Odoo orders.
     Uses original template name + dimensions + "Materiaal:" + visible components.
@@ -259,10 +259,13 @@ def build_order_line_description_odoo(original_product_name, width, height, visi
         width: Product width in mm
         height: Product height in mm
         visible_components: List of formatted visible component strings
+        line_logger: Optional logger instance for parallel processing
         
     Returns:
         str: Description string for order line
     """
+    log = line_logger or logger
+    
     # Convert mm to cm for display
     width_cm = width / 10
     height_cm = height / 10
@@ -274,7 +277,7 @@ def build_order_line_description_odoo(original_product_name, width, height, visi
     if visible_components:
         description += " - Materiaal: " + " - ".join(visible_components)
     
-    logger.info(f"Built Odoo order line description with {len(visible_components)} visible component(s)")
+    log.info(f"Built Odoo order line description with {len(visible_components)} visible component(s)")
     return description
 
 
@@ -453,11 +456,12 @@ def process_order_line_parallel(
         all_component_products = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
             'product.product', 'read',
             [component_product_ids],
-            {'fields': ['name', 'x_studio_product_code']})
+            {'fields': ['name', 'x_studio_product_code', 'x_studio_is_visible_in_portal_reports']})
         
         component_products_by_id = {prod['id']: prod for prod in all_component_products}
         
         components = []
+        visible_components = []  # Build visible components list directly during component fetch
         for bom_line in all_bom_lines:
             component_info = component_products_by_id[bom_line['product_id'][0]]
             component_data = {
@@ -471,8 +475,16 @@ def process_order_line_parallel(
             else:
                 line_logger.debug(f"Copied component: {component_info['name']} ({component_info['x_studio_product_code']})")
             components.append(component_data)
+            
+            # Check visibility and add to visible components list if visible
+            if component_info.get('x_studio_is_visible_in_portal_reports'):
+                comp_ref = component_info.get('x_studio_product_code', '')
+                comp_name = component_info.get('name', '')
+                visible_components.append(f"[{comp_ref}] {comp_name}")
+                line_logger.debug(f"Found visible component: [{comp_ref}] {comp_name}")
         
         line_logger.info(f"Copied {len(components)} components from existing BOM")
+        line_logger.info(f"Found {len(visible_components)} visible component(s) during component fetch")
         
         # Generate product reference
         line_logger.info("Generating product reference")
@@ -502,13 +514,10 @@ def process_order_line_parallel(
         new_product_tmpl_id = product_data[0]['product_tmpl_id'][0]
         line_logger.info(f"New product template ID: {new_product_tmpl_id} (BOM cost will be computed at end)")
         
-        # Get visible components and build order line description
-        line_logger.info("Getting visible components for order line description")
-        visible_components = get_visible_components_list(models, uid, components, line_logger)
-        
+        # Build order line description using pre-computed visible components
         line_logger.info("Building order line description with original product name")
         new_order_line_description = build_order_line_description_odoo(
-            original_product_name, width, height, visible_components
+            original_product_name, width, height, visible_components, line_logger
         )
         
         # Update existing sale order line with new product
