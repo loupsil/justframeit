@@ -11,6 +11,8 @@ import logging
 from datetime import datetime
 import requests
 from utils import log_route_call
+import concurrent.futures
+import threading
 
 # Configure logging
 logging.basicConfig(
@@ -18,6 +20,10 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Thread-safe counter for unique product references
+_reference_counter_lock = threading.Lock()
+_reference_counter = 0
 
 # Load environment variables
 load_dotenv()
@@ -66,21 +72,32 @@ def get_uid():
         logger.error(f"Failed to authenticate with Odoo: {str(e)}")
         raise
 
-def generate_product_reference():
+def generate_product_reference(line_logger=None):
     """
     Generate a unique product reference using the current timestamp in microseconds.
+    Thread-safe: uses a counter to ensure uniqueness even when called simultaneously.
     
     Converts the Unix timestamp in microseconds to base36 (0-9, A-Z).
     Each microsecond produces a unique reference (~10-11 characters).
     
+    Args:
+        line_logger: Optional logger instance for parallel processing
+    
     Returns:
         str: Unique product reference (e.g., 'HF4D2K8M1P')
     """
+    global _reference_counter
+    
     # Base36 alphabet: 0-9, A-Z (36 characters, uppercase only)
     BASE36_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     
-    # Get current Unix timestamp in microseconds for unique reference
-    timestamp = int(time.time() * 1000000)
+    # Thread-safe: combine timestamp with a counter to ensure uniqueness
+    with _reference_counter_lock:
+        _reference_counter += 1
+        counter_value = _reference_counter
+    
+    # Get current Unix timestamp in microseconds and add counter for uniqueness
+    timestamp = int(time.time() * 1000000) + counter_value
     
     # Convert timestamp to base36
     if timestamp == 0:
@@ -92,7 +109,8 @@ def generate_product_reference():
             reference = BASE36_CHARS[num % 36] + reference
             num //= 36
     
-    logger.info(f"Generated product reference: {reference}")
+    log = line_logger or logger
+    log.info(f"Generated product reference: {reference}")
     return reference
 
 
@@ -182,7 +200,7 @@ def get_or_create_customer(models, uid, customer_data):
     logger.info(f"Created new customer '{customer_data['name']}' with email {customer_data['email']} (ID: {partner_id})")
     return partner_id, 'created'
 
-def get_visible_components_list(models, uid, components):
+def get_visible_components_list(models, uid, components, line_logger=None):
     """
     Get list of visible components (where x_studio_is_visible_in_portal_reports is True).
     Uses batch API call for performance.
@@ -191,10 +209,13 @@ def get_visible_components_list(models, uid, components):
         models: Odoo models proxy
         uid: User ID
         components: List of component dictionaries with 'name' and 'reference' keys
+        line_logger: Optional logger instance for parallel processing
         
     Returns:
         list: List of formatted strings "[reference] component_name" for visible components
     """
+    log = line_logger or logger
+    
     if not components:
         return []
     
@@ -218,13 +239,13 @@ def get_visible_components_list(models, uid, components):
                 comp_ref = comp_info.get('x_studio_product_code', '')
                 comp_name = comp_info.get('name', '')
                 visible_components.append(f"[{comp_ref}] {comp_name}")
-                logger.debug(f"Found visible component: [{comp_ref}] {comp_name}")
+                log.debug(f"Found visible component: [{comp_ref}] {comp_name}")
         
-        logger.info(f"Found {len(visible_components)} visible component(s) from {len(references)} checked")
+        log.info(f"Found {len(visible_components)} visible component(s) from {len(references)} checked")
         return visible_components
         
     except Exception as e:
-        logger.warning(f"Failed to batch check visibility for components: {str(e)}")
+        log.warning(f"Failed to batch check visibility for components: {str(e)}")
         return []
 
 
@@ -272,7 +293,289 @@ def build_visible_components_suffix(visible_components):
     return ""
 
 
-def create_product_and_bom(models, uid, product_name, product_reference, width, height, price, components, product_template_attribute_value_ids=None, original_template_name=None):
+def process_order_line_parallel(
+    uid, line_index, total_lines, order_line_id,
+    order_lines_by_id, products_by_id, bom_by_product, bom_by_template, sale_order_id
+):
+    """
+    Process a single order line in parallel. Each line gets its own log buffer
+    and its own Odoo connection (xmlrpc is not thread-safe).
+    
+    Args:
+        uid: User ID
+        line_index: Index of the order line (0-based)
+        total_lines: Total number of order lines
+        order_line_id: ID of the order line to process
+        order_lines_by_id: Pre-fetched order line data dictionary
+        products_by_id: Pre-fetched product data dictionary
+        bom_by_product: Pre-fetched variant BOM data dictionary
+        bom_by_template: Pre-fetched template BOM data dictionary
+        sale_order_id: ID of the sale order
+        
+    Returns:
+        tuple: (result_dict, log_string) where result_dict contains processing results
+               and log_string contains all log messages for this order line
+    """
+    # Create a thread-local StringIO for capturing logs
+    line_log_buffer = StringIO()
+    line_handler = logging.StreamHandler(line_log_buffer)
+    line_handler.setLevel(logging.DEBUG)
+    line_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    
+    # Create a thread-specific logger
+    line_logger = logging.getLogger(f'justframeit.line.{order_line_id}')
+    line_logger.handlers = []  # Clear any existing handlers
+    line_logger.addHandler(line_handler)
+    line_logger.setLevel(logging.DEBUG)
+    line_logger.propagate = False  # Don't propagate to parent (main logger)
+    
+    try:
+        # CRITICAL: Create a thread-local Odoo connection
+        # xmlrpc.client.ServerProxy is NOT thread-safe, so each thread needs its own connection
+        models = get_odoo_models()
+        line_logger.info(f"--- Processing order line {line_index + 1}/{total_lines} (ID: {order_line_id}) ---")
+        
+        # Get order line details from pre-fetched data
+        order_line = [order_lines_by_id[order_line_id]]
+        product_info = [products_by_id[order_line[0]['product_id'][0]]]
+        
+        # Extract product details
+        width = product_info[0]['x_studio_width']
+        height = product_info[0]['x_studio_height']
+        price = order_line[0]['price_unit']
+        quantity = order_line[0]['product_uom_qty']
+        current_product_name = product_info[0].get('display_name') or product_info[0]['name']
+        original_product_code = product_info[0]['default_code']
+        order_line_description = order_line[0].get('name', '')
+        product_description_sale = product_info[0].get('description_sale', '')
+        
+        # Check if current product is already a PR product (re-execution scenario)
+        pr_pattern = r'PR\d{6}'
+        is_pr_product = bool(re.search(pr_pattern, current_product_name or ''))
+        
+        if is_pr_product:
+            original_product_name = None
+            if product_description_sale and product_description_sale.startswith('Original: '):
+                original_product_name = product_description_sale[10:].strip()
+                line_logger.info(f"Detected re-execution: Retrieved original template name '{original_product_name}' from product description_sale")
+            
+            if not original_product_name and order_line_description:
+                dimension_pattern = r'^(.+?)\s*\(\d+\.?\d*x\d+\.?\d*\)'
+                match = re.match(dimension_pattern, order_line_description)
+                if match:
+                    extracted_name = match.group(1).strip()
+                    if not re.search(pr_pattern, extracted_name):
+                        original_product_name = extracted_name
+                        line_logger.info(f"Detected re-execution: Extracted original template name '{original_product_name}' from order line description")
+            
+            if not original_product_name:
+                original_product_name = current_product_name
+                line_logger.warning(f"Re-execution detected but couldn't recover original name. Using: {original_product_name}")
+        else:
+            original_product_name = current_product_name
+        
+        line_logger.info(f"Extracted product specs: {width}mm x {height}mm, €{price}, qty: {quantity}")
+        line_logger.info(f"Current product: {current_product_name} ({original_product_code})")
+        line_logger.info(f"Original template name for description: {original_product_name}")
+        
+        # Check if quantity is different than 1 (preset products - skip processing)
+        if quantity != 1:
+            line_logger.info(f"Product '{current_product_name}' has quantity {quantity} (preset). Skipping processing for this order line.")
+            result = {
+                'order_line_id': order_line_id,
+                'original_product': current_product_name,
+                'status': 'skipped',
+                'reason': f'Preset product (quantity: {quantity})',
+                'chatter_message': f"ℹ️ Product '{current_product_name}' has quantity {quantity} (preset). Processing has been skipped for this order line."
+            }
+            line_logger.info(f"--- Completed processing order line {line_index + 1}/{total_lines} ---")
+            return (result, line_log_buffer.getvalue())
+        
+        # Check if product is updatable (variants are not updatable)
+        product_updatable = order_line[0]['product_updatable']
+        product_template_attribute_value_ids = order_line[0]['product_template_attribute_value_ids']
+        
+        if not product_updatable:
+            line_logger.warning(f"Product '{original_product_name}' is a variant and not updatable. Processing blocked for this order line.")
+            result = {
+                'order_line_id': order_line_id,
+                'original_product': original_product_name,
+                'status': 'skipped',
+                'reason': 'Product is unupdatable (variant)',
+                'chatter_message': f"⚠️ Product '{original_product_name}' is a variant and cannot be updated on order line {order_line_id}. Processing has been blocked for this order line."
+            }
+            line_logger.info(f"--- Completed processing order line {line_index + 1}/{total_lines} ---")
+            return (result, line_log_buffer.getvalue())
+        
+        # Get BOM for the existing product from pre-fetched data
+        line_logger.info("Finding BOM for existing product (from batch data)")
+        
+        product_id = order_line[0]['product_id'][0]
+        product_tmpl_id = product_info[0]['product_tmpl_id'][0]
+        is_variant = len(product_template_attribute_value_ids) > 0
+        
+        bom_data = None
+        if is_variant:
+            line_logger.info(f"Product is a variant (ID: {product_id}), looking up variant-specific BOM")
+            bom_data = bom_by_product.get(product_id)
+        
+        if not bom_data:
+            line_logger.info(f"Looking up template BOM for template ID: {product_tmpl_id}")
+            bom_data = bom_by_template.get(product_tmpl_id)
+        
+        if not bom_data:
+            bom_type = "variant-specific" if is_variant else "template"
+            line_logger.warning(f"No {bom_type} BOM found for product '{original_product_name}' - skipping this line")
+            result = {
+                'order_line_id': order_line_id,
+                'original_product': original_product_name,
+                'status': 'skipped',
+                'reason': f'No {bom_type} BOM found'
+            }
+            line_logger.info(f"--- Completed processing order line {line_index + 1}/{total_lines} ---")
+            return (result, line_log_buffer.getvalue())
+        
+        bom_type_found = "variant-specific" if bom_data.get('product_id') and bom_data['product_id'][0] == product_id else "template"
+        line_logger.info(f"Found BOM ID: {bom_data['id']} ({bom_type_found} BOM)")
+        
+        bom_info = [bom_data]
+        
+        # Fetch BOM lines and component products
+        line_logger.info("Copying components from existing BOM (batch fetch)")
+        bom_line_ids = bom_info[0]['bom_line_ids']
+        
+        all_bom_lines = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+            'mrp.bom.line', 'read',
+            [bom_line_ids],
+            {'fields': ['product_id', 'product_qty']})
+        
+        component_product_ids = [line['product_id'][0] for line in all_bom_lines]
+        all_component_products = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+            'product.product', 'read',
+            [component_product_ids],
+            {'fields': ['name', 'x_studio_product_code']})
+        
+        component_products_by_id = {prod['id']: prod for prod in all_component_products}
+        
+        components = []
+        for bom_line in all_bom_lines:
+            component_info = component_products_by_id[bom_line['product_id'][0]]
+            component_data = {
+                'name': component_info['name'],
+                'reference': component_info['x_studio_product_code']
+            }
+            original_qty = bom_line.get('product_qty', 1)
+            if original_qty != 1:
+                component_data['qty'] = original_qty
+                line_logger.debug(f"Copied component: {component_info['name']} ({component_info['x_studio_product_code']}) with original qty: {original_qty}")
+            else:
+                line_logger.debug(f"Copied component: {component_info['name']} ({component_info['x_studio_product_code']})")
+            components.append(component_data)
+        
+        line_logger.info(f"Copied {len(components)} components from existing BOM")
+        
+        # Generate product reference
+        line_logger.info("Generating product reference")
+        product_name = generate_product_reference(line_logger)
+        product_reference = product_name
+        line_logger.info(f"New product name: {product_name}")
+        line_logger.info(f"New product reference: {product_reference}")
+        
+        # Create product and BOM
+        line_logger.info("Creating new product and BOM")
+        new_product_id, bom_id, bom_components_count, bom_operations_count, skipped_components = create_product_and_bom(
+            models, uid,
+            product_name, product_reference,
+            width, height, price, components,
+            original_template_name=original_product_name,
+            line_logger=line_logger
+        )
+        
+        if skipped_components:
+            line_logger.warning(f"Order line {line_index + 1}: {len(skipped_components)} component(s) were skipped")
+        
+        # Get the product template ID from the created product
+        product_data = models.execute_kw(
+            ODOO_DB, uid, ODOO_API_KEY,
+            'product.product', 'read', [new_product_id], {'fields': ['product_tmpl_id']}
+        )
+        new_product_tmpl_id = product_data[0]['product_tmpl_id'][0]
+        line_logger.info(f"New product template ID: {new_product_tmpl_id} (BOM cost will be computed at end)")
+        
+        # Get visible components and build order line description
+        line_logger.info("Getting visible components for order line description")
+        visible_components = get_visible_components_list(models, uid, components, line_logger)
+        
+        line_logger.info("Building order line description with original product name")
+        new_order_line_description = build_order_line_description_odoo(
+            original_product_name, width, height, visible_components
+        )
+        
+        # Update existing sale order line with new product
+        if product_updatable:
+            line_logger.info(f"Updating order line {order_line_id} with new product")
+            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                'sale.order', 'write',
+                [sale_order_id, {
+                    'order_line': [(1, order_line_id, {
+                        'product_id': new_product_id,
+                        'product_uom_qty': quantity,
+                        'price_unit': price,
+                        'name': new_order_line_description
+                    })]
+                }])
+            line_logger.info(f"Order line {order_line_id} updated successfully with quantity: {quantity}")
+        else:
+            line_logger.info(f"Skipping order line {order_line_id} update because product is not updatable (variant)")
+        
+        # Build result
+        result = {
+            'order_line_id': order_line_id,
+            'original_product': original_product_name,
+            'original_product_code': original_product_code,
+            'new_product_id': new_product_id,
+            'new_product_tmpl_id': new_product_tmpl_id,
+            'new_product_name': product_name,
+            'new_product_reference': product_reference,
+            'bom_id': bom_id,
+            'width': width,
+            'height': height,
+            'price': price,
+            'quantity': quantity,
+            'components': components,
+            'skipped_components': skipped_components,
+            'bom_components_count': bom_components_count,
+            'bom_operations_count': bom_operations_count,
+            'initial_cost': 0,
+            'new_cost': 0,
+            'status': 'success'
+        }
+        
+        line_logger.info(f"--- Completed processing order line {line_index + 1}/{total_lines} ---")
+        return (result, line_log_buffer.getvalue())
+        
+    except Exception as e:
+        line_logger.error(f"Error processing order line {order_line_id}: {str(e)}")
+        # Include all expected keys to avoid KeyErrors downstream
+        result = {
+            'order_line_id': order_line_id,
+            'original_product': f'Unknown (error during processing)',
+            'original_product_code': '',
+            'status': 'error',
+            'reason': str(e)
+        }
+        logs = line_log_buffer.getvalue()
+        line_logger.removeHandler(line_handler)
+        return (result, logs)
+    finally:
+        try:
+            line_logger.removeHandler(line_handler)
+            line_log_buffer.close()
+        except:
+            pass
+
+
+def create_product_and_bom(models, uid, product_name, product_reference, width, height, price, components, product_template_attribute_value_ids=None, original_template_name=None, line_logger=None):
     """
     Shared function to create product and BOM with components and operations.
 
@@ -289,20 +592,24 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
                     this quantity is used directly without recalculation.
         product_template_attribute_value_ids: List of attribute value IDs for variants (optional)
         original_template_name: Original template/variant name to store for reference (optional)
+        line_logger: Optional logger instance for parallel processing
 
     Returns:
         tuple: (product_id, bom_id, bom_components_count, bom_operations_count, skipped_components)
                skipped_components is a list of dicts with 'name', 'reference', 'reason' for components not found
     """
-    logger.info("Starting product and BOM creation process")
-    logger.info(f"Product: {product_name} (ref: {product_reference})")
-    logger.info(f"Dimensions: {width}mm x {height}mm, Price: €{price}")
-    logger.info(f"Components: {len(components)} items")
+    # Use provided logger or fall back to global logger
+    log = line_logger or logger
+    
+    log.info("Starting product and BOM creation process")
+    log.info(f"Product: {product_name} (ref: {product_reference})")
+    log.info(f"Dimensions: {width}mm x {height}mm, Price: €{price}")
+    log.info(f"Components: {len(components)} items")
     if original_template_name:
-        logger.info(f"Original template name: {original_template_name}")
+        log.info(f"Original template name: {original_template_name}")
 
     # Create product
-    logger.info("Creating product in Odoo")
+    log.info("Creating product in Odoo")
     product_vals = {
         'name': product_name,
         'type': 'consu',
@@ -320,29 +627,29 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
     # Add variant attributes if provided (for variant products)
     if product_template_attribute_value_ids:
         product_vals['product_template_attribute_value_ids'] = [(6, 0, product_template_attribute_value_ids)]
-        logger.info(f"Including {len(product_template_attribute_value_ids)} variant attribute(s) in new product")
+        log.info(f"Including {len(product_template_attribute_value_ids)} variant attribute(s) in new product")
 
-    logger.debug(f"Product creation values: {product_vals}")
+    log.debug(f"Product creation values: {product_vals}")
     product_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
         'product.product', 'create', [product_vals])
-    logger.info(f"Product created with ID: {product_id}")
+    log.info(f"Product created with ID: {product_id}")
 
     # Create components and BOM
-    logger.info("Setting up BOM creation")
+    log.info("Setting up BOM creation")
     bom_components = []
     bom_operations = []
     surface = width * height
     circumference = 2 * (width + height)
 
-    logger.info(f"Surface: {surface} mm² ({surface/1000000:.4f} m²)")
-    logger.info(f"Circumference: {circumference} mm ({circumference/1000:.2f} m)")
+    log.info(f"Surface: {surface} mm² ({surface/1000000:.4f} m²)")
+    log.info(f"Circumference: {circumference} mm ({circumference/1000:.2f} m)")
 
     # Convert dimensions to meters for duration rules
     surface_m2 = surface / 1000000  # Convert mm² to m²
     circumference_m = circumference / 1000  # Convert mm to m
-    logger.debug(f"Converted dimensions - Surface: {surface_m2} m², Circumference: {circumference_m} m")
+    log.debug(f"Converted dimensions - Surface: {surface_m2} m², Circumference: {circumference_m} m")
 
-    logger.info("Processing components for BOM")
+    log.info("Processing components for BOM")
     skipped_components = []  # Track skipped components for logging
     
     # BATCH OPTIMIZATION: Fetch all components, services, and duration rules upfront
@@ -350,7 +657,7 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
     
     # Step 1: Collect all references and batch search_read all components
     references = [c['reference'] for c in components if c.get('reference')]
-    logger.info(f"Batch fetching {len(references)} components by reference")
+    log.info(f"Batch fetching {len(references)} components by reference")
     
     all_component_data = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
         'product.product', 'search_read',
@@ -360,7 +667,7 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
     
     # Create lookup by reference
     components_by_ref = {c['x_studio_product_code']: c for c in all_component_data}
-    logger.info(f"Found {len(all_component_data)} components in Odoo")
+    log.info(f"Found {len(all_component_data)} components in Odoo")
     
     # Step 2: Collect all unique service IDs and duration rule IDs for batch fetch
     service_ids = set()
@@ -374,7 +681,7 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
     # Step 3: Batch fetch all services
     services_by_id = {}
     if service_ids:
-        logger.info(f"Batch fetching {len(service_ids)} services")
+        log.info(f"Batch fetching {len(service_ids)} services")
         all_services = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
             'x_services', 'read',
             [list(service_ids)],
@@ -384,7 +691,7 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
     # Step 4: Batch fetch all duration rules
     duration_rules_by_id = {}
     if duration_rule_ids:
-        logger.info(f"Batch fetching {len(duration_rule_ids)} duration rules")
+        log.info(f"Batch fetching {len(duration_rule_ids)} duration rules")
         all_duration_rules = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
             'x_services_duration_rules', 'read',
             [list(duration_rule_ids)],
@@ -393,7 +700,7 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
     
     # Step 5: Process components using batch-fetched data
     for i, component in enumerate(components, 1):
-        logger.info(f"Processing component {i}/{len(components)}: {component['name']} (ref: {component['reference']})")
+        log.info(f"Processing component {i}/{len(components)}: {component['name']} (ref: {component['reference']})")
 
         # Look up component from batch data
         component_info = components_by_ref.get(component['reference'])
@@ -401,7 +708,7 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
         if not component_info:
             # Log warning and skip this component instead of crashing
             skip_message = f"Component '{component['name']}' with reference '{component['reference']}' not found in Odoo - SKIPPED"
-            logger.warning(skip_message)
+            log.warning(skip_message)
             skipped_components.append({
                 'name': component['name'],
                 'reference': component['reference'],
@@ -410,53 +717,53 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
             continue  # Skip to next component
 
         component_id = component_info['id']
-        logger.info(f"Found component ID: {component_id}")
+        log.info(f"Found component ID: {component_id}")
 
         # Check if component has an existing quantity (from original BOM) that's not 1
         # If so, use it directly without recalculation
         if 'qty' in component and component['qty'] != 1:
             quantity = component['qty']
-            logger.debug(f"Quantity from original BOM: {quantity} (preserved without recalculation)")
+            log.debug(f"Quantity from original BOM: {quantity} (preserved without recalculation)")
         # Otherwise, calculate quantity based on price computation method
         elif component_info.get('x_studio_price_computation') == 'Circumference':
             quantity = circumference_m
-            logger.debug(f"Quantity calculation: Circumference method → {quantity} m")
+            log.debug(f"Quantity calculation: Circumference method → {quantity} m")
         elif component_info.get('x_studio_price_computation') == 'Surface':
             quantity = surface_m2
-            logger.debug(f"Quantity calculation: Surface method → {quantity} m²")
+            log.debug(f"Quantity calculation: Surface method → {quantity} m²")
         else:
             quantity = 1
-            logger.debug("Quantity calculation: Default method → 1 unit")
+            log.debug("Quantity calculation: Default method → 1 unit")
 
-        logger.info(f"Component quantity: {quantity}")
+        log.info(f"Component quantity: {quantity}")
 
         # Add to BOM components
-        logger.debug("Adding component to BOM")
+        log.debug("Adding component to BOM")
         bom_components.append((0, 0, {
             'product_id': component_id,
             'product_qty': quantity,
         }))
-        logger.info("Added component to BOM")
+        log.info("Added component to BOM")
 
         # Handle associated service/operation using batch-fetched data
         if component_info.get('x_studio_associated_service'):
             service_id = component_info['x_studio_associated_service'][0]
-            logger.info(f"Processing associated service ID: {service_id}")
+            log.info(f"Processing associated service ID: {service_id}")
 
             # Get service details from batch data
             service_info = services_by_id.get(service_id)
             if not service_info:
-                logger.warning(f"Service ID {service_id} not found in batch data - skipping operation")
+                log.warning(f"Service ID {service_id} not found in batch data - skipping operation")
                 continue
                 
-            logger.debug(f"Service info: {service_info['x_name']}")
+            log.debug(f"Service info: {service_info['x_name']}")
 
             # Get duration rules from batch data
             duration_rule_ids_for_component = component_info.get('x_studio_associated_service_duration_rule', [])
             duration_rules = [duration_rules_by_id[rid] for rid in duration_rule_ids_for_component if rid in duration_rules_by_id]
 
             if not duration_rules:
-                logger.warning(f"No duration rules found for component {component['reference']} - skipping operation")
+                log.warning(f"No duration rules found for component {component['reference']} - skipping operation")
                 continue
 
             # Find appropriate duration based on x_studio_quantity
@@ -464,54 +771,54 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
             rules_sorted = sorted(duration_rules, key=lambda x: x['x_studio_quantity'])
             matching_rule = next((rule for rule in rules_sorted if rule['x_studio_quantity'] >= relevant_value), rules_sorted[-1])
             duration_seconds = matching_rule['x_duurtijd_totaal']
-            logger.debug(f"Duration calculation: Quantity-based ({relevant_value}) → {duration_seconds} seconds")
+            log.debug(f"Duration calculation: Quantity-based ({relevant_value}) → {duration_seconds} seconds")
 
             # Convert duration from seconds to minutes and calculate MM:SS format
             duration_minutes = duration_seconds / 60
             minutes = int(duration_minutes)
             seconds = int((duration_minutes - minutes) * 60)
             odoo_display = f"{minutes:02d}:{seconds:02d}"
-            logger.info(f"Duration for {service_info['x_name']}: {duration_seconds}s = {duration_minutes:.2f}min ({odoo_display})")
+            log.info(f"Duration for {service_info['x_name']}: {duration_seconds}s = {duration_minutes:.2f}min ({odoo_display})")
 
             # Add operation to BOM
-            logger.debug("Adding operation to BOM")
+            log.debug("Adding operation to BOM")
             bom_operations.append((0, 0, {
                 'name': service_info['x_name'],
                 'time_cycle_manual': duration_minutes,
                 'workcenter_id': service_info['x_studio_associated_work_center'][0] if service_info.get('x_studio_associated_work_center') else False
             }))
-            logger.info("Added operation to BOM")
+            log.info("Added operation to BOM")
 
     # Log summary of skipped components
     if skipped_components:
-        logger.warning(f"⚠️ {len(skipped_components)} component(s) were SKIPPED (not found in Odoo):")
+        log.warning(f"⚠️ {len(skipped_components)} component(s) were SKIPPED (not found in Odoo):")
         for skipped in skipped_components:
-            logger.warning(f"  - {skipped['name']} (ref: {skipped['reference']}): {skipped['reason']}")
+            log.warning(f"  - {skipped['name']} (ref: {skipped['reference']}): {skipped['reason']}")
     else:
-        logger.info("All components were found and added to BOM")
+        log.info("All components were found and added to BOM")
 
     # Get the product template ID from the created product
-    logger.info("Getting product template ID")
+    log.info("Getting product template ID")
     product_data = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY,
         'product.product', 'read', [product_id], {'fields': ['product_tmpl_id']}
     )
     product_tmpl_id = product_data[0]['product_tmpl_id'][0]
-    logger.debug(f"Product template ID: {product_tmpl_id}")
+    log.debug(f"Product template ID: {product_tmpl_id}")
 
     # Set route_ids for finished products (MTO and Manufacturing, exclude Buy)
-    logger.info("Setting route_ids for finished product (MTO and Manufacturing)")
+    log.info("Setting route_ids for finished product (MTO and Manufacturing)")
     models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY,
         'product.template', 'write',
         [[product_tmpl_id], {'route_ids': [(6, 0, [1, 4])]}]  # 1=MTO, 4=Manufacture
     )
-    logger.info("Successfully set route_ids to [1, 4] (MTO and Manufacturing)")
+    log.info("Successfully set route_ids to [1, 4] (MTO and Manufacturing)")
 
     # Create Bill of Materials using the template ID
-    logger.info("Creating Bill of Materials")
-    logger.info(f"BOM components: {len(bom_components)}")
-    logger.info(f"BOM operations: {len(bom_operations)}")
+    log.info("Creating Bill of Materials")
+    log.info(f"BOM components: {len(bom_components)}")
+    log.info(f"BOM operations: {len(bom_operations)}")
 
     bom_vals = {
         'product_tmpl_id': product_tmpl_id,
@@ -521,12 +828,12 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
         'operation_ids': bom_operations,
     }
 
-    logger.debug(f"BOM creation values: {len(bom_components)} components, {len(bom_operations)} operations")
+    log.debug(f"BOM creation values: {len(bom_components)} components, {len(bom_operations)} operations")
     bom_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
         'mrp.bom', 'create', [bom_vals])
 
-    logger.info(f"BOM created with ID: {bom_id}")
-    logger.info("Product and BOM creation completed successfully")
+    log.info(f"BOM created with ID: {bom_id}")
+    log.info("Product and BOM creation completed successfully")
 
     return product_id, bom_id, len(bom_components), len(bom_operations), skipped_components
 
@@ -1417,273 +1724,64 @@ def handle_odoo_order():
         
         logger.info(f"BOM batch fetch complete: {len(bom_by_product)} variant BOMs, {len(bom_by_template)} template BOMs")
 
-        for line_index, order_line_id in enumerate(order_line_ids):
-            logger.info(f"--- Processing order line {line_index + 1}/{len(order_line_ids)} (ID: {order_line_id}) ---")
-
-            # Get order line details from pre-fetched data
-            order_line = [order_lines_by_id[order_line_id]]
-            product_info = [products_by_id[order_line[0]['product_id'][0]]]
-
-            # Extract product details
-            width = product_info[0]['x_studio_width']
-            height = product_info[0]['x_studio_height']
-            price = order_line[0]['price_unit']
-            quantity = order_line[0]['product_uom_qty']
-            # Use display_name to get full variant name (e.g., "Kader op maat (Artglass AR99)")
-            # Fallback to name if display_name is not available
-            current_product_name = product_info[0].get('display_name') or product_info[0]['name']
-            original_product_code = product_info[0]['default_code']
-            order_line_description = order_line[0].get('name', '')
-            product_description_sale = product_info[0].get('description_sale', '')
-
-            # Check if current product is already a PR product (re-execution scenario)
-            # PR products have names like PR000001, PR000002, or display_name like [PR000001] PR000001
-            # We check if the name contains the PR pattern anywhere
-            pr_pattern = r'PR\d{6}'
-            is_pr_product = bool(re.search(pr_pattern, current_product_name or ''))
+        # PARALLEL PROCESSING: Process order lines in parallel using ThreadPoolExecutor
+        # Logs are captured per-line and output sequentially after all parallel work completes
+        logger.info(f"Starting parallel processing of {len(order_line_ids)} order lines")
+        
+        total_lines = len(order_line_ids)
+        parallel_results = [None] * total_lines  # Store results in order
+        
+        # Use ThreadPoolExecutor for parallel processing
+        # Max workers limited to avoid overwhelming Odoo with too many concurrent requests
+        max_workers = min(5, total_lines)  # Limit to 5 concurrent workers
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            # Note: Each thread creates its own Odoo connection (xmlrpc is not thread-safe)
+            future_to_index = {}
+            for line_index, order_line_id in enumerate(order_line_ids):
+                future = executor.submit(
+                    process_order_line_parallel,
+                    uid, line_index, total_lines, order_line_id,
+                    order_lines_by_id, products_by_id, bom_by_product, bom_by_template, sale_order_id
+                )
+                future_to_index[future] = line_index
             
-            if is_pr_product:
-                # This is a re-execution - try to recover original template name
-                original_product_name = None
-                
-                # Method 1: Try to get from the PR product's description_sale field
-                # Format: "Original: Kader op maat (Artglass AR99)"
-                if product_description_sale and product_description_sale.startswith('Original: '):
-                    original_product_name = product_description_sale[10:].strip()  # Remove "Original: " prefix
-                    logger.info(f"Detected re-execution: Retrieved original template name '{original_product_name}' from product description_sale")
-                
-                # Method 2: Fallback - try to extract from order line description
-                if not original_product_name and order_line_description:
-                    dimension_pattern = r'^(.+?)\s*\(\d+\.?\d*x\d+\.?\d*\)'
-                    match = re.match(dimension_pattern, order_line_description)
-                    if match:
-                        extracted_name = match.group(1).strip()
-                        # Make sure we didn't just extract another PR product name
-                        if not re.search(pr_pattern, extracted_name):
-                            original_product_name = extracted_name
-                            logger.info(f"Detected re-execution: Extracted original template name '{original_product_name}' from order line description")
-                
-                # Method 3: Final fallback - use current product name
-                if not original_product_name:
-                    original_product_name = current_product_name
-                    logger.warning(f"Re-execution detected but couldn't recover original name. Using: {original_product_name}")
-            else:
-                original_product_name = current_product_name
-
-            logger.info(f"Extracted product specs: {width}mm x {height}mm, €{price}, qty: {quantity}")
-            logger.info(f"Current product: {current_product_name} ({original_product_code})")
-            logger.info(f"Original template name for description: {original_product_name}")
-
-            # Check if quantity is different than 1 (preset products - skip processing)
-            if quantity != 1:
-                logger.info(f"Product '{current_product_name}' has quantity {quantity} (preset). Skipping processing for this order line.")
-                # Add message to sale order chatter
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(future_to_index):
+                line_index = future_to_index[future]
+                try:
+                    result, logs = future.result()
+                    parallel_results[line_index] = (result, logs)
+                except Exception as e:
+                    logger.error(f"Order line {line_index + 1} raised exception: {e}")
+                    parallel_results[line_index] = (
+                        {'order_line_id': order_line_ids[line_index], 'status': 'error', 'reason': str(e)},
+                        f"Error processing order line: {e}\n"
+                    )
+        
+        logger.info("Parallel processing complete, outputting logs in order")
+        
+        # OUTPUT LOGS SEQUENTIALLY: Write logs from each order line in order
+        # This keeps the logs crystal clear and not mixed
+        for line_index, (result, logs) in enumerate(parallel_results):
+            # Output the buffered logs for this order line
+            for log_line in logs.strip().split('\n'):
+                if log_line:
+                    logger.info(f"[Line {line_index + 1}] {log_line}")
+            
+            # Add result to processed_lines
+            processed_lines.append(result)
+            
+            # Handle chatter messages for skipped lines (must be done after parallel processing)
+            if result.get('status') == 'skipped' and result.get('chatter_message'):
                 try:
                     models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
                         'sale.order', 'message_post',
                         [sale_order_id],
-                        {'body': f"ℹ️ Product '{current_product_name}' has quantity {quantity} (preset). Processing has been skipped for this order line."})
+                        {'body': result['chatter_message']})
                 except Exception as e:
-                    logger.warning(f"Failed to post chatter message for preset product: {e}")
-
-                # Track skipped line due to preset (quantity != 1)
-                processed_lines.append({
-                    'order_line_id': order_line_id,
-                    'original_product': current_product_name,
-                    'status': 'skipped',
-                    'reason': f'Preset product (quantity: {quantity})'
-                })
-                continue
-
-            # Check if product is updatable (variants are not updatable)
-            product_updatable = order_line[0]['product_updatable']
-            product_template_attribute_value_ids = order_line[0]['product_template_attribute_value_ids']
-
-            if not product_updatable:
-                logger.warning(f"Product '{original_product_name}' is a variant and not updatable. Processing blocked for this order line.")
-                # Add message to sale order chatter
-                try:
-                    models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                        'sale.order', 'message_post',
-                        [sale_order_id],
-                        {'body': f"⚠️ Product '{original_product_name}' is a variant and cannot be updated on order line {order_line_id}. Processing has been blocked for this order line."})
-                except Exception as e:
-                    logger.warning(f"Failed to post chatter message for unupdatable product: {e}")
-
-                # Track skipped line due to unupdatable product
-                processed_lines.append({
-                    'order_line_id': order_line_id,
-                    'original_product': original_product_name,
-                    'status': 'skipped',
-                    'reason': 'Product is unupdatable (variant)'
-                })
-                continue
-
-            # Get BOM for the existing product from pre-fetched data
-            logger.info("Finding BOM for existing product (from batch data)")
-
-           
-            product_id = order_line[0]['product_id'][0]
-            product_tmpl_id = product_info[0]['product_tmpl_id'][0]
-            
-            # Check if this is a variant product (has specific attribute values)
-            is_variant = len(product_template_attribute_value_ids) > 0
-
-            # Look up BOM from pre-fetched dictionaries
-            bom_data = None
-            if is_variant:
-                # For variant products, look up in variant BOM dict first
-                logger.info(f"Product is a variant (ID: {product_id}), looking up variant-specific BOM")
-                bom_data = bom_by_product.get(product_id)
-            
-            if not bom_data:
-                # For non-variant products, or if variant BOM not found, use template BOM
-                logger.info(f"Looking up template BOM for template ID: {product_tmpl_id}")
-                bom_data = bom_by_template.get(product_tmpl_id)
-
-            if not bom_data:
-                bom_type = "variant-specific" if is_variant else "template"
-                logger.warning(f"No {bom_type} BOM found for product '{original_product_name}' - skipping this line")
-                processed_lines.append({
-                    'order_line_id': order_line_id,
-                    'original_product': original_product_name,
-                    'status': 'skipped',
-                    'reason': f'No {bom_type} BOM found'
-                })
-                continue
-
-            bom_type_found = "variant-specific" if bom_data.get('product_id') and bom_data['product_id'][0] == product_id else "template"
-            logger.info(f"Found BOM ID: {bom_data['id']} ({bom_type_found} BOM)")
-
-            # bom_data already contains bom_line_ids from batch fetch
-            bom_info = [bom_data]
-
-            # BATCH OPTIMIZATION: Get all BOM lines and their products in 2 calls instead of 2N calls
-            logger.info("Copying components from existing BOM (batch fetch)")
-            bom_line_ids = bom_info[0]['bom_line_ids']
-            
-            # Batch fetch all BOM lines in one call
-            all_bom_lines = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                'mrp.bom.line', 'read',
-                [bom_line_ids],
-                {'fields': ['product_id', 'product_qty']})
-            
-            # Batch fetch all component products in one call
-            component_product_ids = [line['product_id'][0] for line in all_bom_lines]
-            all_component_products = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                'product.product', 'read',
-                [component_product_ids],
-                {'fields': ['name', 'x_studio_product_code']})
-            
-            # Create lookup dict for component products
-            component_products_by_id = {prod['id']: prod for prod in all_component_products}
-            
-            # Build components list from batch data
-            components = []
-            for bom_line in all_bom_lines:
-                component_info = component_products_by_id[bom_line['product_id'][0]]
-                component_data = {
-                    'name': component_info['name'],
-                    'reference': component_info['x_studio_product_code']
-                }
-                # Include original quantity if it's not 1 (to preserve it without recalculation)
-                original_qty = bom_line.get('product_qty', 1)
-                if original_qty != 1:
-                    component_data['qty'] = original_qty
-                    logger.debug(f"Copied component: {component_info['name']} ({component_info['x_studio_product_code']}) with original qty: {original_qty}")
-                else:
-                    logger.debug(f"Copied component: {component_info['name']} ({component_info['x_studio_product_code']})")
-                components.append(component_data)
-
-            logger.info(f"Copied {len(components)} components from existing BOM")
-
-            # Generate product name (PR-XXXXXX format using base64 timestamp)
-            logger.info("Generating product reference")
-            product_name = generate_product_reference()
-            product_reference = product_name
-            logger.info(f"New product name: {product_name}")
-            logger.info(f"New product reference: {product_reference}")
-
-            # Use shared function to create product and BOM
-            logger.info("Creating new product and BOM")
-            product_id, bom_id, bom_components_count, bom_operations_count, skipped_components = create_product_and_bom(
-                models, uid,
-                product_name, product_reference,
-                width, height, price, components,
-                original_template_name=original_product_name  # Store original name for future re-executions
-            )
-            
-            # Log skipped components if any
-            if skipped_components:
-                logger.warning(f"Order line {line_index + 1}: {len(skipped_components)} component(s) were skipped")
-
-            # Get the product template ID from the created product (for deferred BOM cost computation)
-            product_data = models.execute_kw(
-                ODOO_DB, uid, ODOO_API_KEY,
-                'product.product', 'read', [product_id], {'fields': ['product_tmpl_id']}
-            )
-            new_product_tmpl_id = product_data[0]['product_tmpl_id'][0]
-            logger.info(f"New product template ID: {new_product_tmpl_id} (BOM cost will be computed at end)")
-
-            # Get visible components and build order line description
-            logger.info("Getting visible components for order line description")
-            visible_components = get_visible_components_list(models, uid, components)
-            
-            # Build description using ORIGINAL product name (not the new PR number)
-            logger.info("Building order line description with original product name")
-            order_line_description = build_order_line_description_odoo(
-                original_product_name, width, height, visible_components
-            )
-
-            # Update existing sale order line with new product (only if product is updatable)
-            if product_updatable:
-                logger.info(f"Updating order line {order_line_id} with new product")
-                models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                    'sale.order', 'write',
-                    [sale_order_id, {
-                        'order_line': [(1, order_line_id, {
-                            'product_id': product_id,
-                            'product_uom_qty': quantity,
-                            'price_unit': price,
-                            'name': order_line_description
-                        })]
-                    }])
-                logger.info(f"Order line {order_line_id} updated successfully with quantity: {quantity}")
-            else:
-                logger.info(f"Skipping order line {order_line_id} update because product is not updatable (variant)")
-                # Add additional message to sale order chatter about the successful BOM creation
-                try:
-                    models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                        'sale.order', 'message_post',
-                        [sale_order_id],
-                        {'body': f"✅ New BOM created for variant product '{original_product_name}' (Order line {order_line_id}). Product ID: {product_id}, BOM ID: {bom_id}."})
-                except Exception as e:
-                    logger.warning(f"Failed to post success message for variant product: {e}")
-
-            # Track processed line results (costs will be computed after loop)
-            processed_lines.append({
-                'order_line_id': order_line_id,
-                'original_product': original_product_name,
-                'original_product_code': original_product_code,
-                'new_product_id': product_id,
-                'new_product_tmpl_id': new_product_tmpl_id,  # Store for deferred BOM cost computation
-                'new_product_name': product_name,
-                'new_product_reference': product_reference,
-                'bom_id': bom_id,
-                'width': width,
-                'height': height,
-                'price': price,
-                'quantity': quantity,
-                'components': components,
-                'skipped_components': skipped_components,
-                'bom_components_count': bom_components_count,
-                'bom_operations_count': bom_operations_count,
-                'initial_cost': 0,  # Will be populated after batch BOM cost computation
-                'new_cost': 0,      # Will be populated after batch BOM cost computation
-                'status': 'success'
-            })
-
-            logger.info(f"--- Completed processing order line {line_index + 1}/{len(order_line_ids)} ---")
+                    logger.warning(f"Failed to post chatter message: {e}")
 
         # BATCH BOM COST COMPUTATION: Compute costs for all created products at once
         # This is more efficient than computing during the loop (especially with many components)
