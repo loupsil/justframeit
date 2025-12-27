@@ -296,6 +296,119 @@ def build_visible_components_suffix(visible_components):
     return ""
 
 
+def build_additional_description(line_item_options, site_name, product_title=None, line_logger=None):
+    """
+    Build the additional description (x_studio_additional_description) for a web order line.
+    
+    This generates a structured description with product details, dimensions, and components
+    based on the line item options from a Craft CMS order.
+    
+    Args:
+        line_item_options: The 'options' dict from a line item
+        site_name: The webshop name (e.g., "JustFrameIt")
+        product_title: The product title (e.g., "Kader op maat")
+        line_logger: Optional logger instance
+        
+    Returns:
+        str: Formatted additional description string
+    """
+    log = line_logger or logger
+    
+    try:
+        configuration = line_item_options.get('configuration', {})
+        
+        # Extract basic info
+        framed = configuration.get('framed', '')  # e.g., 'company'
+        
+        # Use provided product title or default
+        type_description = product_title or '-'
+        
+        # Determine if framing is included
+        inlijsten = "Ja" if framed == 'company' else "Nee"
+        
+        # Extract dimensions (from configuration, in cm - convert to mm)
+        frame_width_mm = int(configuration.get('width', 0) * 10)
+        frame_height_mm = int(configuration.get('height', 0) * 10)
+        
+        # Extract passe partout dimensions (already in mm, convert to int for display)
+        pp_data = line_item_options.get('passePartout', {})
+        pp_left = int(pp_data.get('widthLeft', 0))
+        pp_right = int(pp_data.get('widthRight', 0))
+        pp_top = int(pp_data.get('widthTop', 0))
+        pp_bottom = int(pp_data.get('widthBottom', 0))
+        pp_overlap = int(line_item_options.get('passePartoutOverlap', 0))
+        
+        # Calculate object dimensions (frame - passe partout on each side)
+        object_width_mm = frame_width_mm - pp_left - pp_right
+        object_height_mm = frame_height_mm - pp_top - pp_bottom
+        
+        # Extract passe partout finish
+        pp_finish_raw = line_item_options.get('passePartoutFinish') or configuration.get('passePartoutFinish', '')
+        # Map finish values to Dutch descriptions
+        pp_finish_map = {
+            'classic': 'Normaal',
+            'normal': 'Normaal',
+            'v-groove': 'V-groef',
+            'vgroove': 'V-groef',
+        }
+        pp_finish = pp_finish_map.get(pp_finish_raw.lower() if pp_finish_raw else '', pp_finish_raw or 'Normaal')
+        
+        # Extract component SKUs
+        list_sku = configuration.get('listSku', '')
+        glass_sku = configuration.get('glassSku', '')
+        pp_sku_list = configuration.get('passePartoutSku', [])
+        pp_sku = pp_sku_list[0] if pp_sku_list else ''
+        backcover_sku = configuration.get('backCoverSku', '')
+        print_option_value = line_item_options.get('printOption') or configuration.get('printOption', '')
+        
+        # Extract photo URL
+        photo_info = line_item_options.get('photo', {})
+        photo_url = photo_info.get('path', '') if isinstance(photo_info, dict) else ''
+        
+        # Build the description
+        lines = []
+        
+        # Algemeen section
+        lines.append("Algemeen")
+        lines.append(f"Webshop: {site_name}")
+        lines.append(f"Type product: {type_description}")
+        lines.append(f"Inlijsten: {inlijsten}")
+        lines.append("")
+        
+        # Afmetingen section
+        lines.append("Afmetingen")
+        lines.append(f"Object formaat:{object_width_mm}mm x {object_height_mm}mm")
+        lines.append(f"Passe Partout:{pp_left}mm (L) x {pp_right}mm (R) x {pp_top}mm (B) x {pp_bottom}mm (O)")
+        lines.append(f"Kader formaat:{frame_width_mm}mm x {frame_height_mm}mm")
+        lines.append(f"Passe Partout overlap: {pp_overlap}mm")
+        
+        # Opmerkingen section
+        lines.append("Opmerkingen")
+        lines.append("Onderdelen van deze bestelling:")
+        if list_sku:
+            lines.append(f"- Lijst: {list_sku}")
+        if glass_sku:
+            lines.append(f"- Glas: {glass_sku}")
+        if pp_sku:
+            lines.append(f"- PP: {pp_sku}")
+        lines.append(f"- Afwerking passepartout: {pp_finish}")
+        if backcover_sku:
+            lines.append(f"- Backcover: {backcover_sku}")
+        if print_option_value:
+            lines.append(f"- Afdrukoptie: {print_option_value}")
+        if photo_url:
+            lines.append(f"Opgeladen beeld: {photo_url}")
+        
+        description = "\n".join(lines)
+        log.info(f"Built additional description ({len(description)} chars)")
+        
+        return description
+        
+    except Exception as e:
+        log.error(f"Error building additional description: {str(e)}")
+        return ""
+
+
 def process_order_line_parallel(
     uid, line_index, total_lines, order_line_id,
     order_lines_by_id, products_by_id, bom_by_product, bom_by_template, sale_order_id
@@ -1022,6 +1135,10 @@ def interpret_craft_payload(craft_payload):
                 if photo_url:
                     logger.info(f"Found photo URL for line item {item_index + 1}: {photo_url}")
 
+            # Extract product title from snapshot
+            snapshot = line_item.get('snapshot', {})
+            product_title = snapshot.get('title') or snapshot.get('product', {}).get('title', '')
+            
             product = {
                 'width': width,
                 'height': height,
@@ -1030,7 +1147,9 @@ def interpret_craft_payload(craft_payload):
                 'discount': discount_percent,
                 'components': components,
                 'description': description,
-                'photo_url': photo_url
+                'photo_url': photo_url,
+                'line_item_options': options,  # Store for additional description generation
+                'product_title': product_title  # Store product title for additional description
             }
             products.append(product)
 
@@ -1133,6 +1252,8 @@ def handle_web_order():
             # Convert Craft payload to simple format
             logger.info("Detected Craft CMS payload, converting to simple format")
             payload = interpret_craft_payload(data)
+            # Store site name for additional description generation
+            payload['site_name'] = data.get('siteName', '')
         else:
             # Assume it's already in simple format
             logger.info("Detected simple payload format")
@@ -1322,6 +1443,17 @@ def handle_web_order():
             
             order_lines.append((0, 0, order_line_vals))
             
+            # Build additional description for web orders (Craft CMS only)
+            additional_description = ''
+            if is_craft_payload and product_data.get('line_item_options'):
+                site_name = payload.get('site_name', '')
+                product_title = product_data.get('product_title', '')
+                additional_description = build_additional_description(
+                    product_data['line_item_options'],
+                    site_name,
+                    product_title
+                )
+            
             # Track created product info for logging
             created_products.append({
                 'product_id': product_id,
@@ -1340,7 +1472,8 @@ def handle_web_order():
                 'visible_components': visible_components,
                 'photo_url': photo_url,
                 'image_base64': image_base64,
-                'image_attachment_id': image_attachment_id
+                'image_attachment_id': image_attachment_id,
+                'additional_description': additional_description
             })
             
             logger.info(f"Product {product_index + 1} created: ID={product_id}, BOM ID={bom_id}, Qty={qty}, Discount={discount}%")
@@ -1356,8 +1489,8 @@ def handle_web_order():
         order_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
             'sale.order', 'create', [order_vals])
 
-        # Update order lines to append visible components to descriptions
-        logger.info("Updating order lines with visible components")
+        # Update order lines to append visible components to descriptions and set additional description
+        logger.info("Updating order lines with visible components and additional description")
         sale_order_data = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
             'sale.order', 'read', [order_id], {'fields': ['order_line']})
         order_line_ids = sale_order_data[0]['order_line']
@@ -1366,6 +1499,9 @@ def handle_web_order():
             if line_idx < len(created_products):
                 prod = created_products[line_idx]
                 visible_comps = prod.get('visible_components', [])
+                additional_desc = prod.get('additional_description', '')
+                
+                update_vals = {}
                 
                 if visible_comps:
                     # Read current description
@@ -1376,11 +1512,19 @@ def handle_web_order():
                     # Append visible components suffix
                     components_suffix = build_visible_components_suffix(visible_comps)
                     new_description = current_description + components_suffix
-                    
-                    # Update order line description
+                    update_vals['name'] = new_description
+                
+                # Set additional description for web orders
+                if additional_desc:
+                    update_vals['x_studio_additional_description'] = additional_desc
+                    logger.info(f"Setting additional description for order line {order_line_id}")
+                
+                # Update order line if there are changes
+                if update_vals:
                     models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
-                        'sale.order.line', 'write', [[order_line_id], {'name': new_description}])
-                    logger.info(f"Updated order line {order_line_id} with {len(visible_comps)} visible component(s)")
+                        'sale.order.line', 'write', [[order_line_id], update_vals])
+                    logger.info(f"Updated order line {order_line_id} with {len(visible_comps)} visible component(s)" + 
+                               (", additional description set" if additional_desc else ""))
 
         logger.info("Web order processing completed successfully")
         logger.info(f"Results - Customer ID: {partner_id}, Products: {len(created_products)}, Order ID: {order_id}")
