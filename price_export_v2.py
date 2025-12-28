@@ -284,6 +284,84 @@ def get_default_dimensions():
     return dimensions
 
 
+def build_duration_lookup(duration_rules):
+    """
+    Pre-build a lookup dictionary for duration rules, organized by service name.
+    Each service has a sorted list of (quantity, duration) tuples for fast binary search.
+    
+    Args:
+        duration_rules: List of duration rule dictionaries from Odoo
+        
+    Returns:
+        dict: {service_name: {'sorted_rules': [(qty, duration), ...], 'max_duration': duration}}
+    """
+    import bisect
+    
+    lookup = {}
+    
+    for rule in duration_rules:
+        service_name = get_service_name(rule.get('x_associated_service'))
+        if not service_name:
+            continue
+            
+        qty = rule.get('x_studio_quantity') or 0
+        duration = rule.get('x_duurtijd_totaal') or 0
+        
+        if service_name not in lookup:
+            lookup[service_name] = {'rules': [], 'max_duration': 0, 'max_qty': 0}
+        
+        lookup[service_name]['rules'].append((qty, duration))
+        
+        # Track the rule with max quantity for fallback
+        if qty > lookup[service_name]['max_qty']:
+            lookup[service_name]['max_qty'] = qty
+            lookup[service_name]['max_duration'] = duration
+    
+    # Sort rules by quantity for each service (enables binary search)
+    for service_name in lookup:
+        lookup[service_name]['rules'].sort(key=lambda x: x[0])
+        # Extract just quantities for bisect
+        lookup[service_name]['quantities'] = [r[0] for r in lookup[service_name]['rules']]
+        lookup[service_name]['durations'] = [r[1] for r in lookup[service_name]['rules']]
+    
+    return lookup
+
+
+def lookup_service_duration_fast(service_name, quantity_threshold, duration_lookup):
+    """
+    Fast duration lookup using pre-built dictionary and binary search.
+    
+    Args:
+        service_name: The service name to look up
+        quantity_threshold: The dimension value to match
+        duration_lookup: Pre-built lookup dictionary from build_duration_lookup()
+        
+    Returns:
+        The duration in seconds, or 0 if not found
+    """
+    import bisect
+    
+    if service_name not in duration_lookup:
+        return 0
+    
+    service_data = duration_lookup[service_name]
+    quantities = service_data['quantities']
+    durations = service_data['durations']
+    
+    if not quantities:
+        return 0
+    
+    # Binary search: find leftmost quantity >= threshold
+    idx = bisect.bisect_left(quantities, quantity_threshold)
+    
+    if idx < len(quantities):
+        # Found a quantity >= threshold
+        return durations[idx]
+    else:
+        # No matching rule, return max quantity rule's duration (fallback)
+        return service_data['max_duration']
+
+
 def lookup_service_duration(service_name, quantity_threshold, duration_rules):
     """
     Replicate the Excel MINIFS/FILTER/INDEX logic to find service duration.
@@ -336,6 +414,59 @@ def get_service_name(service_value):
     if isinstance(service_value, (list, tuple)):
         return str(service_value[1]) if len(service_value) > 1 else str(service_value[0]) if service_value else ''
     return str(service_value) if service_value else ''
+
+
+def compute_prices_vectorized(product, dimensions, duration_lookup, margin):
+    """
+    Compute prices for a product across ALL dimensions at once using vectorized operations.
+    
+    This is much faster than calling compute_price individually for each dimension.
+    
+    Args:
+        product: Product dictionary from Odoo
+        dimensions: List of tuples (width_mm, height_mm, width_cm, height_cm, surface_m2, circumference_m)
+        duration_lookup: Pre-built lookup dictionary from build_duration_lookup()
+        margin: Margin/markup percentage (e.g., 0.5 for 50%)
+        
+    Returns:
+        List of computed prices (floats)
+    """
+    import numpy as np
+    
+    # Pre-extract product fields (once per product, not per dimension)
+    price_computation = get_service_name(product.get('x_studio_price_computation'))
+    standard_price = product.get('standard_price') or 0
+    service_name = get_service_name(product.get('x_studio_associated_service'))
+    cost_per_hour = product.get('x_studio_associated_cost_per_employee_per_hour') or 0
+    
+    is_circumference = (price_computation == 'Circumference')
+    
+    # Extract dimension arrays (vectorized)
+    surfaces = np.array([d[4] for d in dimensions])  # surface_m2
+    circumferences = np.array([d[5] for d in dimensions])  # circumference_m
+    
+    # Determine dimension values and base costs based on computation method
+    if is_circumference:
+        dimension_values = circumferences
+        base_costs = circumferences * standard_price
+    else:
+        dimension_values = surfaces
+        base_costs = surfaces * standard_price
+    
+    # Lookup durations for all dimensions (this is still per-dimension but uses fast lookup)
+    durations = np.array([
+        lookup_service_duration_fast(service_name, dv, duration_lookup)
+        for dv in dimension_values
+    ])
+    
+    # Calculate labor costs: duration * cost_per_hour / 3600
+    labor_costs = (durations * cost_per_hour) / 3600
+    
+    # Apply margin: (base + labor) * (1 + margin)
+    total_prices = (base_costs + labor_costs) * (1 + margin)
+    
+    # Round to 2 decimal places
+    return np.round(total_prices, 2).tolist()
 
 
 def compute_price(product, dimension, duration_rules, margin):
@@ -493,10 +624,18 @@ def generate_csv_direct(models, uid, pricelist_name=None):
         logger.info(f"Fetched {len(duration_rules)} duration rules")
         
         # =============================================
-        # 📋 STEP 4: Get dimensions
+        # 📋 STEP 4: Get dimensions and build lookup
         # =============================================
         dimensions = get_dimensions_from_config(models, uid)
         logger.info(f"Using {len(dimensions)} dimensions")
+        
+        # Pre-build duration lookup for fast access (O(1) instead of O(n) per lookup)
+        logger.info("Building duration rules lookup dictionary...")
+        duration_lookup = build_duration_lookup(duration_rules)
+        logger.info(f"Built lookup for {len(duration_lookup)} services")
+        
+        # Pre-compute dimension labels once
+        dimension_labels = [f"{dim[2]} x {dim[3]}" for dim in dimensions]
         
         # =============================================
         # 📋 STEP 5: Generate CSV for each pricelist
@@ -518,25 +657,28 @@ def generate_csv_direct(models, uid, pricelist_name=None):
             writer = csv.writer(csv_buffer, delimiter=',')
             
             # Create header row with dimension labels
-            dimension_labels = [f"{dim[2]} x {dim[3]}" for dim in dimensions]
             header_row = ['product_tmpl_id'] + dimension_labels
             writer.writerow(header_row)
             
-            # Create data rows for each product
-            for product in products:
+            # Create data rows for each product using vectorized computation
+            for idx, product in enumerate(products):
                 # Get product template ID
                 product_tmpl_id = product.get('product_tmpl_id')
                 if isinstance(product_tmpl_id, (list, tuple)):
                     product_tmpl_id = product_tmpl_id[0]
                 
-                # Compute price for each dimension
-                prices = []
-                for dimension in dimensions:
-                    price = compute_price(product, dimension, duration_rules, margin)
-                    prices.append(f"{price:.2f}")
+                # Compute prices for ALL dimensions at once (vectorized)
+                prices = compute_prices_vectorized(product, dimensions, duration_lookup, margin)
                 
-                row = [str(product_tmpl_id)] + prices
+                # Format as strings
+                price_strings = [f"{p:.2f}" for p in prices]
+                
+                row = [str(product_tmpl_id)] + price_strings
                 writer.writerow(row)
+                
+                # Log progress every 500 products
+                if (idx + 1) % 500 == 0:
+                    logger.info(f"Processed {idx + 1}/{len(products)} products for '{pl_name}'")
             
             # Get CSV bytes
             csv_content = csv_buffer.getvalue()
