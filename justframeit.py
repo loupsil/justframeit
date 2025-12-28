@@ -256,8 +256,8 @@ def build_order_line_description_odoo(original_product_name, width, height, visi
     
     Args:
         original_product_name: Original product template name
-        width: Product width in mm
-        height: Product height in mm
+        width: Product width in cm
+        height: Product height in cm
         visible_components: List of formatted visible component strings
         line_logger: Optional logger instance for parallel processing
         
@@ -266,12 +266,8 @@ def build_order_line_description_odoo(original_product_name, width, height, visi
     """
     log = line_logger or logger
     
-    # Convert mm to cm for display
-    width_cm = width / 10
-    height_cm = height / 10
-    
-    # Start with original product name and dimensions
-    description = f"{original_product_name} ({width_cm}x{height_cm})"
+    # Start with original product name and dimensions (already in cm)
+    description = f"{original_product_name} ({width}x{height})"
     
     # Add visible components with "Materiaal:" prefix
     if visible_components:
@@ -326,21 +322,21 @@ def build_additional_description(line_item_options, site_name, product_title=Non
         # Determine if framing is included
         inlijsten = "Ja" if framed == 'company' else "Nee"
         
-        # Extract dimensions (from configuration, in cm - convert to mm)
-        frame_width_mm = int(configuration.get('width', 0) * 10)
-        frame_height_mm = int(configuration.get('height', 0) * 10)
+        # Extract dimensions (from configuration, in cm)
+        frame_width_cm = configuration.get('width', 0)
+        frame_height_cm = configuration.get('height', 0)
         
-        # Extract passe partout dimensions (already in mm, convert to int for display)
+        # Extract passe partout dimensions (from Craft in mm, convert to cm for display)
         pp_data = line_item_options.get('passePartout', {})
-        pp_left = int(pp_data.get('widthLeft', 0))
-        pp_right = int(pp_data.get('widthRight', 0))
-        pp_top = int(pp_data.get('widthTop', 0))
-        pp_bottom = int(pp_data.get('widthBottom', 0))
-        pp_overlap = int(line_item_options.get('passePartoutOverlap', 0))
+        pp_left_cm = pp_data.get('widthLeft', 0) / 10
+        pp_right_cm = pp_data.get('widthRight', 0) / 10
+        pp_top_cm = pp_data.get('widthTop', 0) / 10
+        pp_bottom_cm = pp_data.get('widthBottom', 0) / 10
+        pp_overlap_cm = line_item_options.get('passePartoutOverlap', 0) / 10
         
         # Calculate object dimensions (frame - passe partout on each side)
-        object_width_mm = frame_width_mm - pp_left - pp_right
-        object_height_mm = frame_height_mm - pp_top - pp_bottom
+        object_width_cm = frame_width_cm - pp_left_cm - pp_right_cm
+        object_height_cm = frame_height_cm - pp_top_cm - pp_bottom_cm
         
         # Extract passe partout finish
         pp_finish_raw = line_item_options.get('passePartoutFinish') or configuration.get('passePartoutFinish', '')
@@ -377,10 +373,10 @@ def build_additional_description(line_item_options, site_name, product_title=Non
         
         # Afmetingen section
         lines.append("Afmetingen")
-        lines.append(f"Object formaat:{object_width_mm}mm x {object_height_mm}mm")
-        lines.append(f"Passe Partout:{pp_left}mm (L) x {pp_right}mm (R) x {pp_top}mm (B) x {pp_bottom}mm (O)")
-        lines.append(f"Kader formaat:{frame_width_mm}mm x {frame_height_mm}mm")
-        lines.append(f"Passe Partout overlap: {pp_overlap}mm")
+        lines.append(f"Object formaat:{object_width_cm}cm x {object_height_cm}cm")
+        lines.append(f"Passe Partout:{pp_left_cm}cm (L) x {pp_right_cm}cm (R) x {pp_top_cm}cm (B) x {pp_bottom_cm}cm (O)")
+        lines.append(f"Kader formaat:{frame_width_cm}cm x {frame_height_cm}cm")
+        lines.append(f"Passe Partout overlap: {pp_overlap_cm}cm")
         
         # Opmerkingen section
         lines.append("Opmerkingen")
@@ -455,9 +451,9 @@ def process_order_line_parallel(
         order_line = [order_lines_by_id[order_line_id]]
         product_info = [products_by_id[order_line[0]['product_id'][0]]]
         
-        # Extract product details
-        width = product_info[0]['x_studio_width']
-        height = product_info[0]['x_studio_height']
+        # Extract product details (Odoo stores dimensions in cm)
+        width = product_info[0]['x_studio_width']  # cm
+        height = product_info[0]['x_studio_height']  # cm
         price = order_line[0]['price_unit']
         quantity = order_line[0]['product_uom_qty']
         current_product_name = product_info[0].get('display_name') or product_info[0]['name']
@@ -490,7 +486,7 @@ def process_order_line_parallel(
         else:
             original_product_name = current_product_name
         
-        line_logger.info(f"Extracted product specs: {width}mm x {height}mm, €{price}, qty: {quantity}")
+        line_logger.info(f"Extracted product specs: {width}cm x {height}cm, €{price}, qty: {quantity}")
         line_logger.info(f"Current product: {current_product_name} ({original_product_code})")
         line_logger.info(f"Original template name for description: {original_product_name}")
         
@@ -707,8 +703,8 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
         uid: User ID
         product_name: Name for the product
         product_reference: Reference/Default code for the product
-        width: Product width in mm
-        height: Product height in mm
+        width: Product width in cm
+        height: Product height in cm
         price: Product price
         components: List of component dictionaries with 'name' and 'reference' keys.
                     Optionally includes 'qty' key - if provided and not equal to 1,
@@ -728,18 +724,18 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
     
     log.info("Starting product and BOM creation process")
     log.info(f"Product: {product_name} (ref: {product_reference})")
-    log.info(f"Dimensions: {width}mm x {height}mm, Price: €{price}")
+    log.info(f"Dimensions: {width}cm x {height}cm, Price: €{price}")
     log.info(f"Components: {len(components)} items")
     if original_template_name:
         log.info(f"Original template name: {original_template_name}")
 
-    # Create product
+    # Create product (dimensions already in cm for Odoo storage)
     log.info("Creating product in Odoo")
     product_vals = {
         'name': product_name,
         'type': 'consu',
-        'x_studio_width': width,
-        'x_studio_height': height,
+        'x_studio_width': width,  # cm
+        'x_studio_height': height,  # cm
         'list_price': price,
         'default_code': product_reference,
         'categ_id': 8,  # Set category ID to 8
@@ -772,12 +768,12 @@ def create_product_and_bom(models, uid, product_name, product_reference, width, 
     surface = width * height
     circumference = 2 * (width + height)
 
-    log.info(f"Surface: {surface} mm² ({surface/1000000:.4f} m²)")
-    log.info(f"Circumference: {circumference} mm ({circumference/1000:.2f} m)")
+    log.info(f"Surface: {surface} cm² ({surface/10000:.4f} m²)")
+    log.info(f"Circumference: {circumference} cm ({circumference/100:.2f} m)")
 
     # Convert dimensions to meters for duration rules
-    surface_m2 = surface / 1000000  # Convert mm² to m²
-    circumference_m = circumference / 1000  # Convert mm to m
+    surface_m2 = surface / 10000  # Convert cm² to m²
+    circumference_m = circumference / 100  # Convert cm to m
     log.debug(f"Converted dimensions - Surface: {surface_m2} m², Circumference: {circumference_m} m")
 
     log.info("Processing components for BOM")
@@ -1044,9 +1040,9 @@ def interpret_craft_payload(craft_payload):
 
             logger.debug(f"Configuration keys: {list(configuration.keys()) if configuration else 'None'}")
 
-            # Extract dimensions (convert from cm to mm)
-            width_cm = configuration.get('width', 0)
-            height_cm = configuration.get('height', 0)
+            # Extract dimensions (in cm)
+            width = configuration.get('width', 0)
+            height = configuration.get('height', 0)
             
             # Use unit price (excl. VAT) instead of total (incl. VAT) to avoid double VAT
             price = line_item.get('price', 0)
@@ -1054,11 +1050,7 @@ def interpret_craft_payload(craft_payload):
             # Extract quantity
             qty = line_item.get('qty', 1)
 
-            # Convert cm to mm
-            width = width_cm * 10
-            height = height_cm * 10
-
-            logger.info(f"Line item {item_index + 1}: {width}mm x {height}mm, Unit Price: €{price}, Qty: {qty}")
+            logger.info(f"Line item {item_index + 1}: {width}cm x {height}cm, Unit Price: €{price}, Qty: {qty}")
 
             # Extract components from priceBreakdown (contains all products with SKUs)
             logger.info(f"Extracting components from priceBreakdown for line item {item_index + 1}")
@@ -1656,13 +1648,13 @@ def handle_web_order():
 <ul>
 <li>Product ID: {prod['product_id']} (ref: {prod['product_reference']})</li>
 <li>BOM ID: {prod['bom_id']}</li>
-<li>Dimensions: {prod['width']}mm x {prod['height']}mm</li>
+<li>Dimensions: {prod['width']}cm x {prod['height']}cm</li>
 <li>Unit Price: €{prod['price']}</li>
 <li>Quantity: {prod['qty']}</li>
 {discount_html}
 {photo_html}
-<li>Surface: {prod['width'] * prod['height']} mm² ({(prod['width'] * prod['height'])/1000000:.4f} m²)</li>
-<li>Circumference: {2 * (prod['width'] + prod['height'])} mm ({2 * (prod['width'] + prod['height'])/1000:.2f} m)</li>
+<li>Surface: {prod['width'] * prod['height']} cm² ({(prod['width'] * prod['height'])/10000:.4f} m²)</li>
+<li>Circumference: {2 * (prod['width'] + prod['height'])} cm ({2 * (prod['width'] + prod['height'])/100:.2f} m)</li>
 <li>BOM components: {prod['bom_components_count']} items</li>
 <li>BOM operations: {prod['bom_operations_count']} items</li>
 </ul>
@@ -2103,11 +2095,11 @@ def handle_odoo_order():
 <li>New Product: {line['new_product_name']} (ref: {line['new_product_reference']})</li>
 <li>New Product ID: {line['new_product_id']}</li>
 <li>New BOM ID: {line['bom_id']}</li>
-<li>Dimensions: {line['width']}mm x {line['height']}mm</li>
+<li>Dimensions: {line['width']}cm x {line['height']}cm</li>
 <li>Quantity: {line['quantity']}</li>
 <li>Price: €{line['price']}</li>
-<li>Surface: {line['width'] * line['height']} mm² ({(line['width'] * line['height'])/1000000:.4f} m²)</li>
-<li>Circumference: {2 * (line['width'] + line['height'])} mm ({2 * (line['width'] + line['height'])/1000:.2f} m)</li>
+<li>Surface: {line['width'] * line['height']} cm² ({(line['width'] * line['height'])/10000:.4f} m²)</li>
+<li>Circumference: {2 * (line['width'] + line['height'])} cm ({2 * (line['width'] + line['height'])/100:.2f} m)</li>
 <li>BOM components: {line['bom_components_count']}, Operations: {line['bom_operations_count']}</li>
 <li>Initial cost: €{line['initial_cost']}, New cost: €{line['new_cost']}</li>
 </ul>
