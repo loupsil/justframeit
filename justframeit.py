@@ -1518,6 +1518,12 @@ def handle_web_order():
                     logger.info(f"Updated order line {order_line_id} with {len(visible_comps)} visible component(s)" + 
                                (", additional description set" if additional_desc else ""))
 
+        # Confirm the sale order (move from quotation to sale order state)
+        logger.info("Confirming sale order")
+        models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+            'sale.order', 'action_confirm', [[order_id]])
+        logger.info(f"Sale order {order_id} confirmed successfully")
+
         logger.info("Web order processing completed successfully")
         logger.info(f"Results - Customer ID: {partner_id}, Products: {len(created_products)}, Order ID: {order_id}")
 
